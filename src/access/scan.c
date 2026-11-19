@@ -15,6 +15,7 @@
 #include <catalog/namespace.h>
 #include <catalog/pg_am_d.h>
 #include <fmgr.h>
+#include <math.h>
 #include <pgstat.h>
 #include <storage/bufmgr.h>
 #include <storage/lmgr.h>
@@ -135,17 +136,20 @@ tp_scan_filter_reset(TpScanOpaque so)
 	so->filter_state = TP_FILTER_NONE;
 }
 
-static int
-tp_ctid_cmp(const void *a, const void *b)
-{
-	return ItemPointerCompare((ItemPointer)a, (ItemPointer)b);
-}
+#define ST_SORT			 tp_sort_tid_keys
+#define ST_ELEMENT_TYPE	 uint64
+#define ST_COMPARE(a, b) (*(a) < *(b) ? -1 : *(a) > *(b))
+#define ST_SCOPE		 static
+#define ST_DECLARE
+#define ST_DEFINE
+#include <lib/sort_template.h>
 
 /*
  * Read the heap TIDs the filter hint's clause can match from its btree.
  * The btree returns dead and invisible entries too, so the set is a
  * superset of the visible matching rows; the executor's Filter rechecks
- * each row.  Any doubt about the btree falls back to the unfiltered scan.
+ * each row.  Any doubt about the btree falls back to the unfiltered scan,
+ * and so does a row set above max_rows or above max_share of the table.
  */
 static void
 tp_scan_build_filter(IndexScanDesc scan, TpScanOpaque so)
@@ -157,18 +161,27 @@ tp_scan_build_filter(IndexScanDesc scan, TpScanOpaque so)
 	ScanKeyData		   key;
 	ItemPointer		   tid;
 	MemoryContext	   oldcontext;
-	int				   cap		= tp_filter_pushdown_max_rows;
-	int				   n		= 0;
-	int				   alloced	= 0;
-	bool			   overflow = false;
-	ItemPointer		   tids		= NULL;
+	int				   cap		 = tp_filter_pushdown_max_rows;
+	double			   max_share = tp_filter_pushdown_max_share;
+	double			   reltuples = 0;
+	double			   rows		 = hint->est_rows;
+	int				   n		 = 0;
+	int				   alloced	 = 0;
+	bool			   overflow	 = false;
+	uint64			  *keys		 = NULL;
+	ItemPointer		   tids		 = NULL;
 
 	so->filter_state = TP_FILTER_FALLBACK;
+	if (heap != NULL)
+		reltuples = heap->rd_rel->reltuples;
 
-	if (!tp_filter_pushdown || cap <= 0 || heap == NULL ||
+	if (!tp_filter_pushdown || cap <= 0 || max_share <= 0 || heap == NULL ||
 		scan->xs_snapshot == NULL || !IsMVCCSnapshot(scan->xs_snapshot) ||
-		hint->est_rows > cap)
+		hint->est_rows > cap || hint->selectivity > max_share)
 		goto done;
+
+	if (reltuples > 0)
+		cap = (int)Min((double)cap, floor(max_share * reltuples));
 
 	LockRelationOid(hint->btree_oid, AccessShareLock);
 	if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(hint->btree_oid)))
@@ -212,33 +225,43 @@ tp_scan_build_filter(IndexScanDesc scan, TpScanOpaque so)
 		}
 		if (n >= alloced)
 		{
-			alloced = alloced == 0 ? 1024 : Min(alloced * 2, cap);
-			tids	= tids == NULL
-							? palloc(alloced * sizeof(ItemPointerData))
-							: repalloc(tids, alloced * sizeof(ItemPointerData));
+			alloced = alloced == 0 ? Min(1024, Max(cap, 1))
+								   : Min(alloced * 2, cap);
+			keys	= keys == NULL ? palloc(alloced * sizeof(uint64))
+								   : repalloc(keys, alloced * sizeof(uint64));
 		}
-		tids[n++] = *tid;
+		keys[n++] = ((uint64)ItemPointerGetBlockNumberNoCheck(tid) << 16) |
+					ItemPointerGetOffsetNumberNoCheck(tid);
 	}
 	index_endscan(bscan);
-	MemoryContextSwitchTo(oldcontext);
 	index_close(btree, NoLock);
 
 	if (overflow)
 	{
-		pfree(tids);
+		pfree(keys);
+		MemoryContextSwitchTo(oldcontext);
+		rows = n + 1;
 		goto done;
 	}
 
-	if (n > 1)
+	if (n > 0)
 	{
 		int w = 1;
 
-		qsort(tids, n, sizeof(ItemPointerData), tp_ctid_cmp);
+		tp_sort_tid_keys(keys, n);
+		tids = palloc(n * sizeof(ItemPointerData));
+		ItemPointerSet(
+				&tids[0], (BlockNumber)(keys[0] >> 16), (OffsetNumber)keys[0]);
 		for (int r = 1; r < n; r++)
-			if (!ItemPointerEquals(&tids[r], &tids[w - 1]))
-				tids[w++] = tids[r];
+			if (keys[r] != keys[r - 1])
+				ItemPointerSet(
+						&tids[w++],
+						(BlockNumber)(keys[r] >> 16),
+						(OffsetNumber)keys[r]);
 		n = w;
+		pfree(keys);
 	}
+	MemoryContextSwitchTo(oldcontext);
 	so->filter_ctids = tids;
 	so->filter_count = n;
 	so->filter_state = TP_FILTER_ACTIVE;
@@ -253,10 +276,13 @@ done:
 				 get_rel_name(hint->btree_oid));
 		else
 			elog(NOTICE,
-				 "BM25 filter pushdown not used (estimated %.0f rows, limit "
-				 "%d)",
-				 hint->est_rows,
-				 cap);
+				 "BM25 filter pushdown not used (%s %.0f of %.0f rows, "
+				 "limits %d rows and share %g)",
+				 overflow ? "more than" : "estimated",
+				 overflow ? rows - 1 : rows,
+				 Max(reltuples, 0),
+				 tp_filter_pushdown_max_rows,
+				 max_share);
 	}
 }
 

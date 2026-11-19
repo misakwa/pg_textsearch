@@ -12,7 +12,10 @@
 --   * passes   - a small filtered set needs one scoring pass
 --   * sources  - two segments plus the memtable, HOT and non-HOT updates
 --   * re-drive - rows lost above the scan (a join) still re-drive it
---   * fallback - above pg_textsearch.filter_pushdown_max_rows
+--   * density  - a sparse filter (3 rows) gallops over each segment's
+--                CTID map, a dense one (10% of the table) merges with it
+--   * fallback - above pg_textsearch.filter_pushdown_max_rows or above
+--                pg_textsearch.filter_pushdown_max_share of the table
 --   * RLS      - user clauses behind a policy are not pushed
 --   * identity - two BM25 scans in one statement use their own filters
 
@@ -24,7 +27,8 @@ SET enable_bitmapscan = false;
 
 ------------------------------------------------------------------------
 -- Setup: 14,000 docs over 60 collections (coll = id % 60) plus three
--- small ones, words drawn from a 40-word vocabulary.  Two batches are
+-- small ones, words drawn from a 40-word vocabulary.  grp = 1 holds
+-- every tenth doc.  Two batches are
 -- spilled to segments and the third stays in the memtable.
 ------------------------------------------------------------------------
 
@@ -32,10 +36,12 @@ CREATE TABLE fp_docs (
     id    int PRIMARY KEY,
     coll  int NOT NULL,
     owner text NOT NULL,
+    grp   int NOT NULL,
     body  text
 ) WITH (fillfactor = 50);
 
 CREATE INDEX fp_docs_coll ON fp_docs (coll, id);
+CREATE INDEX fp_docs_grp ON fp_docs (grp);
 CREATE INDEX fp_docs_bm25 ON fp_docs USING bm25 (body)
     WITH (text_config = 'simple');
 
@@ -52,19 +58,19 @@ $$;
 
 INSERT INTO fp_docs
 SELECT g, fp_coll(g), CASE WHEN g % 2 = 0 THEN 'fp_reader' ELSE 'other' END,
-       fp_body(g)
+       (g % 10 = 3)::int, fp_body(g)
 FROM generate_series(1, 6000) g;
 SELECT bm25_spill_index('fp_docs_bm25') IS NOT NULL AS spilled;
 
 INSERT INTO fp_docs
 SELECT g, fp_coll(g), CASE WHEN g % 2 = 0 THEN 'fp_reader' ELSE 'other' END,
-       fp_body(g)
+       (g % 10 = 3)::int, fp_body(g)
 FROM generate_series(6001, 12000) g;
 SELECT bm25_spill_index('fp_docs_bm25') IS NOT NULL AS spilled;
 
 INSERT INTO fp_docs
 SELECT g, fp_coll(g), CASE WHEN g % 2 = 0 THEN 'fp_reader' ELSE 'other' END,
-       fp_body(g)
+       (g % 10 = 3)::int, fp_body(g)
 FROM generate_series(12001, 14000) g;
 
 ANALYZE fp_docs;
@@ -191,6 +197,40 @@ FROM (VALUES
 ) v(n, qry, pred)
 ORDER BY n;
 
+------------------------------------------------------------------------
+-- Density: the 3-row filter above gallops; grp = 1 covers 10% of each
+-- segment and merges with its CTID map.  10% is above the default
+-- filter_pushdown_max_share, so these checks raise it.  Equal scores
+-- tied across the cutoff may resolve to different rows with and without
+-- pushdown, so k stops at a score boundary.
+------------------------------------------------------------------------
+
+SET pg_textsearch.filter_pushdown_max_share = 0.5;
+SET client_min_messages = NOTICE;
+SET pg_textsearch.log_filter_pushdown = on;
+SELECT count(*) FROM (
+    SELECT id FROM fp_docs WHERE grp = 1
+    ORDER BY body <@> to_bm25query('w1 w2', 'fp_docs_bm25') LIMIT 10) s;
+RESET pg_textsearch.log_filter_pushdown;
+SET client_min_messages = WARNING;
+
+SELECT n, qry, pred, k, fp_check(qry, pred, k) AS result
+FROM (VALUES
+    (1, 'w1',            'grp = 1',               8),
+    (2, 'w3 w7 w11',     'grp = 1',              50),
+    (3, 'w3 w7 w11 w19', 'grp = 1',            1500),
+    (4, 'w2 w9',         'grp = 1 AND coll = 13', 10)
+) v(n, qry, pred, k)
+ORDER BY n;
+
+SELECT n, qry, pred, fp_oracle(qry, pred) AS result
+FROM (VALUES
+    (1, 'w1 w2',  'grp = 1'),
+    (2, 'w5 w30', 'grp = 1')
+) v(n, qry, pred)
+ORDER BY n;
+RESET pg_textsearch.filter_pushdown_max_share;
+
 -- One scoring pass when the filtered set is smaller than the batch.
 SELECT fp_passes('w1 w2 w3', 'coll = 100', 10) AS passes_small,
        fp_passes('w1 w2 w3', 'coll = 7', 10) AS passes_collection;
@@ -289,6 +329,36 @@ RESET plan_cache_mode;
 RESET pg_textsearch.filter_pushdown_max_rows;
 
 ------------------------------------------------------------------------
+-- Fallback above filter_pushdown_max_share: grp = 1 is 10% of the
+-- table, over the default 0.09, so the planner attaches no filter.  A
+-- generic plan made under a larger share falls back at execution.
+------------------------------------------------------------------------
+
+SET client_min_messages = NOTICE;
+SET pg_textsearch.log_filter_pushdown = on;
+SELECT count(*) FROM (
+    SELECT id FROM fp_docs WHERE grp = 1
+    ORDER BY body <@> to_bm25query('w1 w2', 'fp_docs_bm25') LIMIT 10) s;
+SET client_min_messages = WARNING;
+SELECT fp_check('w1 w2', 'grp = 1', 10) AS share_capped;
+
+SET plan_cache_mode = force_generic_plan;
+SET pg_textsearch.filter_pushdown_max_share = 0.5;
+PREPARE fp_g AS
+    SELECT count(*) FROM (
+        SELECT id FROM fp_docs WHERE coll = 7
+        ORDER BY body <@> to_bm25query('w1 w2', 'fp_docs_bm25') LIMIT 10) s;
+SET client_min_messages = NOTICE;
+EXECUTE fp_g;
+SET pg_textsearch.filter_pushdown_max_share = 0.01;
+EXECUTE fp_g;
+RESET pg_textsearch.log_filter_pushdown;
+SET client_min_messages = WARNING;
+DEALLOCATE fp_g;
+RESET plan_cache_mode;
+RESET pg_textsearch.filter_pushdown_max_share;
+
+------------------------------------------------------------------------
 -- RLS: under a policy the user's clause carries a security level and
 -- is not pushed; results equal the oracle restricted to the policy.
 ------------------------------------------------------------------------
@@ -364,7 +434,9 @@ RESET enable_sort;
 
 SHOW pg_textsearch.filter_pushdown;
 SHOW pg_textsearch.filter_pushdown_max_rows;
+SHOW pg_textsearch.filter_pushdown_max_share;
 SET pg_textsearch.filter_pushdown_max_rows = -1;
+SET pg_textsearch.filter_pushdown_max_share = 1.5;
 
 DROP TABLE fp_acl;
 DROP TABLE fp_docs;

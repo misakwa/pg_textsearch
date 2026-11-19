@@ -557,10 +557,112 @@ ctid_array_bound(
 	return lo;
 }
 
+/* First doc_id in [lo, ndocs) whose CTID is >= tid. */
+static uint32
+segment_ctid_lower_bound(TpSegmentReader *reader, uint32 lo, ItemPointer tid)
+{
+	uint32 hi = reader->header->num_docs;
+
+	while (lo < hi)
+	{
+		uint32			mid = lo + (hi - lo) / 2;
+		ItemPointerData c;
+
+		tp_segment_lookup_ctid(reader, mid, &c);
+		if (ItemPointerCompare(&c, tid) < 0)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo;
+}
+
+/*
+ * Merge sorted TIDs with the segment's CTID arrays read in bulk, starting
+ * at doc_id pos.  Cheaper than galloping once the TIDs are dense, since
+ * each gallop probe is a separate buffer read.
+ */
+static uint32
+segment_merge_ctids(
+		TpSegmentReader		  *reader,
+		uint32				   pos,
+		const ItemPointerData *ctids,
+		int					   nctids,
+		uint32				  *out)
+{
+	uint32		  ndocs	 = reader->header->num_docs;
+	bool		  cached = reader->cached_ctid_pages != NULL;
+	BlockNumber	 *pbuf	 = NULL;
+	OffsetNumber *obuf	 = NULL;
+	uint32		  n		 = 0;
+	int			  j		 = 0;
+
+	if (!cached)
+	{
+		pbuf = palloc(TP_CTID_MERGE_CHUNK * sizeof(BlockNumber));
+		obuf = palloc(TP_CTID_MERGE_CHUNK * sizeof(OffsetNumber));
+	}
+
+	while (pos < ndocs && j < nctids)
+	{
+		uint32				cnt = Min(TP_CTID_MERGE_CHUNK, ndocs - pos);
+		const BlockNumber  *pages;
+		const OffsetNumber *offsets;
+		uint32				i = 0;
+
+		if (cached)
+		{
+			pages	= reader->cached_ctid_pages + pos;
+			offsets = reader->cached_ctid_offsets + pos;
+		}
+		else
+		{
+			tp_segment_read(
+					reader,
+					reader->header->ctid_pages_offset +
+							(uint64)pos * sizeof(BlockNumber),
+					pbuf,
+					cnt * sizeof(BlockNumber));
+			tp_segment_read(
+					reader,
+					reader->header->ctid_offsets_offset +
+							(uint64)pos * sizeof(OffsetNumber),
+					obuf,
+					cnt * sizeof(OffsetNumber));
+			pages	= pbuf;
+			offsets = obuf;
+		}
+
+		while (i < cnt && j < nctids)
+		{
+			BlockNumber	 blk = ItemPointerGetBlockNumberNoCheck(&ctids[j]);
+			OffsetNumber off = ItemPointerGetOffsetNumberNoCheck(&ctids[j]);
+
+			if (pages[i] < blk || (pages[i] == blk && offsets[i] < off))
+				i++;
+			else
+			{
+				if (pages[i] == blk && offsets[i] == off)
+					out[n++] = pos + i++;
+				j++;
+			}
+		}
+		pos += cnt;
+		CHECK_FOR_INTERRUPTS();
+	}
+
+	if (pbuf)
+		pfree(pbuf);
+	if (obuf)
+		pfree(obuf);
+	return n;
+}
+
 /*
  * Map sorted, unique heap TIDs to this segment's doc_ids, ascending.
- * Doc_ids are assigned in CTID order (docmap.c, merge.c), so a gallop
- * over the segment's CTID array finds each TID in O(log gap) lookups.
+ * Doc_ids are assigned in CTID order (docmap.c, merge.c), so sparse TIDs
+ * gallop over the segment's CTID array in O(log gap) lookups each, and
+ * dense ones take one merge over the array.
  * Returns NULL with *count_out = 0 when none of the TIDs is indexed here.
  */
 uint32 *
@@ -592,6 +694,12 @@ tp_segment_doc_ids_for_ctids(
 		return NULL;
 
 	out = palloc((end - start) * sizeof(uint32));
+	if ((uint64)(end - start) * TP_CTID_GALLOP_RATIO >= ndocs)
+	{
+		pos = segment_ctid_lower_bound(reader, 0, (ItemPointer)&ctids[start]);
+		n = segment_merge_ctids(reader, pos, ctids + start, end - start, out);
+		goto finish;
+	}
 	cur = first;
 	for (int j = start; j < end && pos < ndocs; j++)
 	{
@@ -647,6 +755,7 @@ tp_segment_doc_ids_for_ctids(
 		}
 	}
 
+finish:
 	if (n == 0)
 	{
 		pfree(out);
