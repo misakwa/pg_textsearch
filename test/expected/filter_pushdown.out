@@ -14,6 +14,8 @@
 --   * re-drive - rows lost above the scan (a join) still re-drive it
 --   * density  - a sparse filter (3 rows) gallops over each segment's
 --                CTID map, a dense one (10% of the table) merges with it
+--   * runs     - collections stored in runs far apart merge and jump
+--                the gaps; the cost rule prices the entries walked
 --   * fallback - above pg_textsearch.filter_pushdown_max_rows, or where
 --                pg_textsearch.filter_pushdown_cost_ratio expects ranking
 --                the whole index to be cheaper (it is for a small LIMIT
@@ -448,7 +450,7 @@ NOTICE:  BM25 filter pushdown not used (estimated 1400 rows, limit 991 of 14000 
 SELECT count(*) FROM (
     SELECT id FROM fp_docs WHERE grp = 1
     ORDER BY body <@> to_bm25query('w1 w2', 'fp_docs_bm25') LIMIT 2) s;
-NOTICE:  BM25 filter pushdown not used (1405 rows spread over 14000 of 14000 table rows)
+NOTICE:  BM25 filter pushdown not used (1405 rows walking about 14000 of 14000 table rows)
  count 
 -------
      2
@@ -580,6 +582,243 @@ SELECT (SELECT count(*) FROM (
 
 RESET enable_sort;
 ------------------------------------------------------------------------
+-- Runs: collections stored in runs separated by thousands of other rows,
+-- in two segments plus the memtable.  The merge jumps over each gap
+-- with a search instead of walking it, and the cost rule prices the
+-- entries walked rather than the first-to-last span.  coll 1 has runs
+-- of 40 rows about 4,000 apart; coll 2 a run of 1,800 and one of 100
+-- after a gap of 1,500, inside one bulk read; coll 3 runs of 20 about
+-- 1,500 apart; the rest are 50 scattered collections.  tag = 0 marks
+-- coll 1's original rows, and its other values rise along the heap, so
+-- ANALYZE takes tag = 0 for clustered.
+------------------------------------------------------------------------
+CREATE TABLE fp_runs (
+    id   int PRIMARY KEY,
+    coll int NOT NULL,
+    tag  int NOT NULL,
+    body text
+) WITH (fillfactor = 70);
+CREATE INDEX fp_runs_coll ON fp_runs (coll);
+CREATE INDEX fp_runs_tag ON fp_runs (tag);
+CREATE INDEX fp_runs_bm25 ON fp_runs USING bm25 (body)
+    WITH (text_config = 'simple');
+CREATE FUNCTION fp_runs_coll(g int) RETURNS int LANGUAGE sql IMMUTABLE AS $$
+    SELECT CASE WHEN g % 12000 BETWEEN 1000 AND 1039
+                  OR g % 12000 BETWEEN 5000 AND 5039
+                  OR g % 12000 BETWEEN 9000 AND 9039 THEN 1
+                WHEN g % 12000 BETWEEN 2000 AND 3799
+                  OR g % 12000 BETWEEN 5300 AND 5399 THEN 2
+                WHEN g % 1500 < 20 THEN 3
+                ELSE 100 + g % 50 END
+$$;
+CREATE FUNCTION fp_runs_load(lo int, hi int) RETURNS void
+LANGUAGE sql AS $$
+    INSERT INTO fp_runs
+    SELECT g, fp_runs_coll(g),
+           CASE WHEN fp_runs_coll(g) = 1 THEN 0 ELSE 1 + g / 100 END,
+           fp_body(g)
+    FROM generate_series(lo, hi) g
+$$;
+SELECT fp_runs_load(1, 12000);
+ fp_runs_load 
+--------------
+ 
+(1 row)
+
+SELECT bm25_spill_index('fp_runs_bm25') IS NOT NULL AS spilled;
+ spilled 
+---------
+ t
+(1 row)
+
+SELECT fp_runs_load(12001, 24000);
+ fp_runs_load 
+--------------
+ 
+(1 row)
+
+SELECT bm25_spill_index('fp_runs_bm25') IS NOT NULL AS spilled;
+ spilled 
+---------
+ t
+(1 row)
+
+SELECT fp_runs_load(24001, 28000);
+ fp_runs_load 
+--------------
+ 
+(1 row)
+
+ANALYZE fp_runs;
+SELECT coll, count(*) AS rows FROM fp_runs WHERE coll < 100
+GROUP BY coll ORDER BY coll;
+ coll | rows 
+------+------
+    1 |  280
+    2 | 5600
+    3 |  279
+(3 rows)
+
+-- The top-k of one scan as (id, score) rows, with pushdown on or off.
+CREATE FUNCTION fp_runs_list(qry text, pred text, k int, push bool)
+RETURNS TABLE (n bigint, id int, s float8) LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM set_config('pg_textsearch.filter_pushdown', push::text, true);
+    RETURN QUERY EXECUTE format(
+        'SELECT row_number() OVER (), id, s FROM '
+        '(SELECT id, (body <@> to_bm25query(%L, ''fp_runs_bm25''))::float8 AS s '
+        ' FROM fp_runs WHERE %s '
+        ' ORDER BY body <@> to_bm25query(%L, ''fp_runs_bm25'') '
+        ' LIMIT %s) t', qry, pred, qry, k);
+END;
+$$;
+-- Parity with pushdown on and off: the same scores in the same order,
+-- and the same rows above the last score, since rows tied at the cutoff
+-- may differ.  Then the oracle: with k above the match count, exactly
+-- the filtered rows that contain a query term.
+CREATE FUNCTION fp_runs_check(qry text, pred text, k int) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+    on_s   float8[];
+    off_s  float8[];
+    on_id  int[];
+    off_id int[];
+    idx    int[];
+    ora    int[];
+BEGIN
+    SET LOCAL enable_sort = off;
+    CREATE TEMP TABLE fp_on AS SELECT * FROM fp_runs_list(qry, pred, k, true);
+    CREATE TEMP TABLE fp_off AS SELECT * FROM fp_runs_list(qry, pred, k, false);
+    SELECT array_agg(s ORDER BY n),
+           array_agg(id ORDER BY id) FILTER (
+               WHERE s < (SELECT max(s) FROM fp_on))
+    INTO on_s, on_id FROM fp_on;
+    SELECT array_agg(s ORDER BY n),
+           array_agg(id ORDER BY id) FILTER (
+               WHERE s < (SELECT max(s) FROM fp_off))
+    INTO off_s, off_id FROM fp_off;
+    DROP TABLE fp_on, fp_off;
+    IF on_s IS DISTINCT FROM off_s OR on_id IS DISTINCT FROM off_id THEN
+        RETURN format('FAIL pushed=%s %s unpushed=%s %s',
+                      on_id, on_s, off_id, off_s);
+    END IF;
+    PERFORM set_config('pg_textsearch.filter_pushdown', 'on', true);
+    EXECUTE format(
+        'SELECT coalesce(array_agg(id ORDER BY id), ARRAY[]::int[]) '
+        'FROM (SELECT id FROM fp_runs WHERE %s '
+        '      ORDER BY body <@> to_bm25query(%L, ''fp_runs_bm25'') '
+        '      LIMIT 100000) s', pred, qry)
+    INTO idx;
+    EXECUTE format(
+        'SELECT coalesce(array_agg(id ORDER BY id), ARRAY[]::int[]) '
+        'FROM fp_runs WHERE (%s) AND string_to_array(body, '' '') && '
+        '      string_to_array(%L, '' '')', pred, qry)
+    INTO ora;
+    IF idx IS DISTINCT FROM ora THEN
+        RETURN format('FAIL index=%s oracle=%s', idx, ora);
+    END IF;
+    RETURN format('PASS (%s of %s rows)',
+                  coalesce(array_length(on_s, 1), 0),
+                  coalesce(array_length(idx, 1), 0));
+END;
+$$;
+SET client_min_messages = NOTICE;
+SET pg_textsearch.log_filter_pushdown = on;
+SELECT count(*) FROM (
+    SELECT id FROM fp_runs WHERE coll = 1
+    ORDER BY body <@> to_bm25query('w1 w2', 'fp_runs_bm25') LIMIT 10) s;
+NOTICE:  BM25 filter pushdown: 280 rows from index "fp_runs_coll"
+ count 
+-------
+    10
+(1 row)
+
+RESET pg_textsearch.log_filter_pushdown;
+SET client_min_messages = WARNING;
+SELECT n, qry, pred, k, fp_runs_check(qry, pred, k) AS result
+FROM (VALUES
+    (1,  'w1',            'coll = 1',      10),
+    (2,  'w2 w5',         'coll = 1',      30),
+    (3,  'w3 w7 w11',     'coll = 1',    1000),
+    (4,  'w4',            'coll = 2',      10),
+    (5,  'w3 w7 w11',     'coll = 2',     100),
+    (6,  'w0 w1 w2 w3',   'coll = 2',    5000),
+    (7,  'w6',            'coll = 3',       5),
+    (8,  'w2 w9 w13',     'coll = 3',     500),
+    (9,  'w1 w2',         'coll = 117',    20),
+    (10, 'w1 w2 w3',      'tag = 0',     1000)
+) v(n, qry, pred, k)
+ORDER BY n;
+ n  |     qry     |    pred    |  k   |          result          
+----+-------------+------------+------+--------------------------
+  1 | w1          | coll = 1   |   10 | PASS (10 of 53 rows)
+  2 | w2 w5       | coll = 1   |   30 | PASS (30 of 91 rows)
+  3 | w3 w7 w11   | coll = 1   | 1000 | PASS (127 of 127 rows)
+  4 | w4          | coll = 2   |   10 | PASS (10 of 992 rows)
+  5 | w3 w7 w11   | coll = 2   |  100 | PASS (100 of 2343 rows)
+  6 | w0 w1 w2 w3 | coll = 2   | 5000 | PASS (2891 of 2891 rows)
+  7 | w6          | coll = 3   |    5 | PASS (5 of 51 rows)
+  8 | w2 w9 w13   | coll = 3   |  500 | PASS (130 of 130 rows)
+  9 | w1 w2       | coll = 117 |   20 | PASS (20 of 173 rows)
+ 10 | w1 w2 w3    | tag = 0    | 1000 | PASS (133 of 133 rows)
+(10 rows)
+
+-- Updates leave the old TIDs in the segments and put new ones, inside
+-- the segments' heap ranges, in the memtable: body changes in coll 1's
+-- runs, and rows in the gaps moving into coll 1 and coll 3.
+UPDATE fp_runs SET body = body || ' w1' WHERE coll = 1 AND id % 7 = 0;
+UPDATE fp_runs SET coll = 1 WHERE id IN (3000, 3001, 15000, 20500);
+UPDATE fp_runs SET coll = 3 WHERE id IN (700, 13333, 25000);
+SELECT n, qry, pred, k, fp_runs_check(qry, pred, k) AS result
+FROM (VALUES
+    (1, 'w1',          'coll = 1',      10),
+    (2, 'w1 w2 w5',    'coll = 1',    1000),
+    (3, 'w6',          'coll = 3',       5),
+    (4, 'w2 w9 w13',   'coll = 3',     500),
+    (5, 'w3 w7 w11',   'coll = 2',     100)
+) v(n, qry, pred, k)
+ORDER BY n;
+ n |    qry    |   pred   |  k   |         result          
+---+-----------+----------+------+-------------------------
+ 1 | w1        | coll = 1 |   10 | PASS (10 of 86 rows)
+ 2 | w1 w2 w5  | coll = 1 | 1000 | PASS (154 of 154 rows)
+ 3 | w6        | coll = 3 |    5 | PASS (5 of 51 rows)
+ 4 | w2 w9 w13 | coll = 3 |  500 | PASS (130 of 130 rows)
+ 5 | w3 w7 w11 | coll = 2 |  100 | PASS (100 of 2342 rows)
+(5 rows)
+
+-- The cost rule after the btree read prices the entries the merge
+-- walks: tag = 0 is coll 1's rows (321 TIDs after the updates) in 7
+-- runs over the whole table.  Priced by their span, about all 28,000
+-- rows, a seeded LIMIT 1 would fall back at ratio 20; the merge walks
+-- the runs and jumps the gaps, so pushdown stays.  At ratio 10 it falls
+-- back after the read and reports the walked estimate.
+SET client_min_messages = NOTICE;
+SET pg_textsearch.log_filter_pushdown = on;
+SET pg_textsearch.filter_pushdown_cost_ratio = 20;
+SELECT count(*) FROM (
+    SELECT id FROM fp_runs WHERE tag = 0
+    ORDER BY body <@> to_bm25query('w1 w2', 'fp_runs_bm25') LIMIT 1) s;
+NOTICE:  BM25 filter pushdown: 321 rows from index "fp_runs_tag"
+ count 
+-------
+     1
+(1 row)
+
+SET pg_textsearch.filter_pushdown_cost_ratio = 10;
+SELECT count(*) FROM (
+    SELECT id FROM fp_runs WHERE tag = 0
+    ORDER BY body <@> to_bm25query('w1 w2', 'fp_runs_bm25') LIMIT 1) s;
+NOTICE:  BM25 filter pushdown not used (321 rows walking about 7017 of 28000 table rows)
+ count 
+-------
+     1
+(1 row)
+
+RESET pg_textsearch.filter_pushdown_cost_ratio;
+RESET pg_textsearch.log_filter_pushdown;
+SET client_min_messages = WARNING;
+------------------------------------------------------------------------
 -- GUC contract
 ------------------------------------------------------------------------
 SHOW pg_textsearch.filter_pushdown;
@@ -606,5 +845,7 @@ SET pg_textsearch.filter_pushdown_cost_ratio = -1;
 ERROR:  -1 is outside the valid range for parameter "pg_textsearch.filter_pushdown_cost_ratio" (0 .. 1e+06)
 DROP TABLE fp_acl;
 DROP TABLE fp_docs;
+DROP TABLE fp_runs;
 DROP FUNCTION fp_list, fp_check, fp_oracle, fp_passes, fp_acl_list,
-              fp_body, fp_coll;
+              fp_body, fp_coll, fp_runs_coll, fp_runs_load, fp_runs_list,
+              fp_runs_check;
