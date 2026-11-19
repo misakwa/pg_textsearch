@@ -1423,13 +1423,17 @@ verify_pivot_alignment(TpTermState **terms, int pivot_len, uint32 pivot_doc_id)
  * all confirmed pivot terms.
  *
  * Only called after verify_pivot_alignment confirms all pivot
- * terms are positioned at pivot_doc_id, so each term's current
- * posting is guaranteed to be the pivot document.
+ * terms are positioned at pivot_doc_id.  The pivot terms are exactly
+ * the terms positioned at pivot_doc_id, so walk them in query order:
+ * the order of `terms` depends on the traversal, and float addition
+ * of three or more terms is not associative, so summing in that order
+ * would make a document's score depend on the heap threshold.
  */
 static float4
 score_pivot_document(
-		TpTermState **terms,
-		int			  pivot_len,
+		TpTermState **query_terms,
+		int			  term_count,
+		uint32		  pivot_doc_id,
 		float4		  k1,
 		float4		  b,
 		float4		  avg_doc_len)
@@ -1437,13 +1441,13 @@ score_pivot_document(
 	float4 doc_score = 0.0f;
 	int	   i;
 
-	for (i = 0; i < pivot_len; i++)
+	for (i = 0; i < term_count; i++)
 	{
-		TpTermState	   *ts = terms[i];
+		TpTermState	   *ts = query_terms[i];
 		TpBlockPosting *bp;
 		float4			term_score;
 
-		if (!ts->found || ts->iter.finished)
+		if (!ts->found || ts->iter.finished || ts->cur_doc_id != pivot_doc_id)
 			continue;
 
 		bp		   = &ts->iter.block_postings[ts->iter.current_in_block];
@@ -1478,6 +1482,7 @@ score_segment_multi_term_bmw(
 		TpTopKHeap		*heap,
 		TpSegmentReader *reader,
 		TpTermState	   **terms,
+		TpTermState	   **query_terms,
 		int				 term_count,
 		float4			 k1,
 		float4			 b,
@@ -1586,8 +1591,8 @@ score_segment_multi_term_bmw(
 		else
 		{
 			/* Step 5: Score the pivot document */
-			doc_score =
-					score_pivot_document(terms, pivot_len, k1, b, avg_doc_len);
+			doc_score = score_pivot_document(
+					query_terms, term_count, pivot_doc_id, k1, b, avg_doc_len);
 
 			if (doc_score > 0.0f && !tp_topk_dominated(heap, doc_score))
 				tp_topk_add_segment(
@@ -1639,6 +1644,7 @@ tp_score_multi_term_bmw(
 {
 	TpTopKHeap	  heap;
 	TpTermState **terms;
+	TpTermState **query_order;
 	int			  result_count;
 	int			  i;
 
@@ -1661,6 +1667,10 @@ tp_score_multi_term_bmw(
 		terms[i]->query_freq = query_freqs[i];
 	}
 
+	/* WAND reorders terms; scoring walks them in query order. */
+	query_order = palloc(term_count * sizeof(TpTermState *));
+	memcpy(query_order, terms, term_count * sizeof(TpTermState *));
+
 	/* Score memtable (exhaustive - no skip index) */
 	score_memtable_multi_term(
 			&heap, memtable_src, terms, term_count, k1, b, avg_doc_len, stats);
@@ -1682,6 +1692,7 @@ tp_score_multi_term_bmw(
 					&heap,
 					reader,
 					terms,
+					query_order,
 					term_count,
 					k1,
 					b,
@@ -1695,6 +1706,7 @@ tp_score_multi_term_bmw(
 	for (i = 0; i < term_count; i++)
 		pfree(terms[i]);
 	pfree(terms);
+	pfree(query_order);
 
 	/* Resolve CTIDs for segment results before extraction */
 	tp_topk_resolve_ctids(&heap, index);
