@@ -134,9 +134,10 @@ double tp_filtered_seed_margin = TP_DEFAULT_FILTERED_SEED_MARGIN;
  * Filter pushdown: restrict a BM25 top-k scan to the heap TIDs that an
  * equality clause on a btree's leading column can match.
  */
-bool tp_filter_pushdown			 = true;
-int	 tp_filter_pushdown_max_rows = TP_DEFAULT_FILTER_PUSHDOWN_MAX_ROWS;
-bool tp_log_filter_pushdown		 = false;
+bool   tp_filter_pushdown			= true;
+int	   tp_filter_pushdown_max_rows	= TP_DEFAULT_FILTER_PUSHDOWN_MAX_ROWS;
+double tp_filter_pushdown_max_share = TP_DEFAULT_FILTER_PUSHDOWN_MAX_SHARE;
+bool   tp_log_filter_pushdown		= false;
 
 /*
  * Memtable shared-memory cache enable flag.  Gates the read-path
@@ -697,13 +698,32 @@ _PG_init(void)
 	DefineCustomIntVariable(
 			"pg_textsearch.filter_pushdown_max_rows",
 			"Largest row set a BM25 filter pushdown reads from the btree.",
-			"Above this many matching btree entries (estimated at planning, "
+			"A memory bound: the scan keeps 8 bytes per row while it reads "
+			"the btree.  Above this many rows (estimated at planning, "
 			"counted at execution) the scan ranks the whole index as "
 			"without pushdown.  0 disables pushdown.",
 			&tp_filter_pushdown_max_rows,
 			TP_DEFAULT_FILTER_PUSHDOWN_MAX_ROWS,
 			0,
 			INT_MAX / 2,
+			PGC_USERSET,
+			0,
+			NULL,
+			NULL,
+			NULL);
+
+	DefineCustomRealVariable(
+			"pg_textsearch.filter_pushdown_max_share",
+			"Largest fraction of the table a BM25 filter pushdown covers.",
+			"Pushdown costs about the filter's row count, while the "
+			"unfiltered scan gets cheaper as the filter keeps more of the "
+			"table, so above this fraction of the table's rows (estimated "
+			"at planning, counted at execution) the scan ranks the whole "
+			"index.  0 disables pushdown.",
+			&tp_filter_pushdown_max_share,
+			TP_DEFAULT_FILTER_PUSHDOWN_MAX_SHARE,
+			0.0,
+			1.0,
 			PGC_USERSET,
 			0,
 			NULL,
