@@ -16,6 +16,7 @@
 
 #include "index/source.h"
 #include "index/state.h"
+#include "scoring/bm25.h"
 #include "segment/graph_snapshot.h"
 #include "segment/segment.h"
 
@@ -145,6 +146,7 @@ extern int tp_score_single_term_bmw(
 		int							  max_results,
 		ItemPointerData				 *result_ctids,
 		float4						 *result_scores,
+		const TpDocFilter			 *filter,
 		TpBMWStats					 *stats);
 
 /*
@@ -174,6 +176,7 @@ extern int tp_score_multi_term_bmw(
 		int							  max_results,
 		ItemPointerData				 *result_ctids,
 		float4						 *result_scores,
+		const TpDocFilter			 *filter,
 		TpBMWStats					 *stats);
 
 /*

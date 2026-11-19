@@ -535,6 +535,127 @@ tp_segment_open_from_buffile(BufFile *file, uint64 base_offset)
 	return reader;
 }
 
+/* First index in ctids[lo, hi) whose CTID is >= (or > when upper) tid. */
+static int
+ctid_array_bound(
+		const ItemPointerData *ctids,
+		int					   lo,
+		int					   hi,
+		ItemPointer			   tid,
+		bool				   upper)
+{
+	while (lo < hi)
+	{
+		int mid = lo + (hi - lo) / 2;
+		int cmp = ItemPointerCompare((ItemPointer)&ctids[mid], tid);
+
+		if (cmp < 0 || (upper && cmp == 0))
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo;
+}
+
+/*
+ * Map sorted, unique heap TIDs to this segment's doc_ids, ascending.
+ * Doc_ids are assigned in CTID order (docmap.c, merge.c), so a gallop
+ * over the segment's CTID array finds each TID in O(log gap) lookups.
+ * Returns NULL with *count_out = 0 when none of the TIDs is indexed here.
+ */
+uint32 *
+tp_segment_doc_ids_for_ctids(
+		TpSegmentReader		  *reader,
+		const ItemPointerData *ctids,
+		int					   nctids,
+		uint32				  *count_out)
+{
+	uint32			ndocs = reader->header->num_docs;
+	ItemPointerData first;
+	ItemPointerData last;
+	ItemPointerData cur;
+	int				start;
+	int				end;
+	uint32			pos = 0;
+	uint32			n	= 0;
+	uint32		   *out;
+
+	*count_out = 0;
+	if (ndocs == 0 || nctids <= 0 || reader->header->ctid_pages_offset == 0)
+		return NULL;
+
+	tp_segment_lookup_ctid(reader, 0, &first);
+	tp_segment_lookup_ctid(reader, ndocs - 1, &last);
+	start = ctid_array_bound(ctids, 0, nctids, &first, false);
+	end	  = ctid_array_bound(ctids, start, nctids, &last, true);
+	if (start >= end)
+		return NULL;
+
+	out = palloc((end - start) * sizeof(uint32));
+	cur = first;
+	for (int j = start; j < end && pos < ndocs; j++)
+	{
+		ItemPointer target = (ItemPointer)&ctids[j];
+
+		if ((j & 0x3FF) == 0)
+			CHECK_FOR_INTERRUPTS();
+
+		if (ItemPointerCompare(&cur, target) < 0)
+		{
+			uint32 lo	= pos;
+			uint32 hi	= ndocs;
+			uint32 step = 1;
+
+			for (;;)
+			{
+				uint32			probe = lo + step;
+				ItemPointerData c;
+
+				if (probe >= ndocs)
+					break;
+				tp_segment_lookup_ctid(reader, probe, &c);
+				if (ItemPointerCompare(&c, target) >= 0)
+				{
+					hi = probe;
+					break;
+				}
+				lo = probe;
+				step <<= 1;
+			}
+			while (lo + 1 < hi)
+			{
+				uint32			mid = lo + (hi - lo) / 2;
+				ItemPointerData c;
+
+				tp_segment_lookup_ctid(reader, mid, &c);
+				if (ItemPointerCompare(&c, target) < 0)
+					lo = mid;
+				else
+					hi = mid;
+			}
+			pos = hi;
+			if (pos >= ndocs)
+				break;
+			tp_segment_lookup_ctid(reader, pos, &cur);
+		}
+
+		if (ItemPointerEquals(&cur, target))
+		{
+			out[n++] = pos++;
+			if (pos < ndocs)
+				tp_segment_lookup_ctid(reader, pos, &cur);
+		}
+	}
+
+	if (n == 0)
+	{
+		pfree(out);
+		return NULL;
+	}
+	*count_out = n;
+	return out;
+}
+
 void
 tp_segment_enable_ctid_lookup_cache(TpSegmentReader *reader)
 {

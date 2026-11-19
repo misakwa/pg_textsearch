@@ -26,6 +26,8 @@
 #define TPQUERY_FLAG_EXPLICIT_INDEX 0x01 /* Index was explicitly specified */
 #define TPQUERY_FLAG_SEED_HINT		0x02 /* Planner-only filtered-seed hint */
 #define TPQUERY_SEED_HINT_MAGIC		0x54505348U /* "TPSH" */
+#define TPQUERY_FLAG_FILTER_HINT	0x04 /* Planner-only filter pushdown hint */
+#define TPQUERY_FILTER_HINT_MAGIC	0x54504648U /* "TPFH" */
 
 typedef struct TpQuerySeedHint
 {
@@ -33,6 +35,27 @@ typedef struct TpQuerySeedHint
 	int64  k;
 	double selectivity;
 } TpQuerySeedHint;
+
+/*
+ * Planner-only filter pushdown hint: an equality clause on the leading
+ * column of a btree index of the scanned table.  The scan reads the
+ * btree once to restrict scoring to the heap TIDs the clause can match.
+ * The comparison value follows the struct in the trailer, value_len
+ * bytes: the Datum itself for a by-value type, else the datum's bytes.
+ */
+typedef struct TpQueryFilterHint
+{
+	uint32 magic;
+	uint32 value_len;
+	Oid	   btree_oid;	/* btree whose first column the clause tests */
+	Oid	   proc_oid;	/* equality support function of the operator */
+	Oid	   subtype;		/* right-hand type of the operator */
+	Oid	   collation;	/* input collation of the clause */
+	int16  typlen;		/* of the comparison value */
+	bool   typbyval;	/* of the comparison value */
+	double est_rows;	/* planner estimate of rows matching the clause */
+	double selectivity; /* planner selectivity of the clause */
+} TpQueryFilterHint;
 
 /*
  * tpquery data type structure
@@ -85,3 +108,7 @@ bool  tpquery_is_explicit_index(TpQuery *tpquery);
 TpQuery *
 tpquery_copy_with_seed_hint(TpQuery *tpquery, int64 k, double selectivity);
 bool tpquery_get_seed_hint(TpQuery *tpquery, int64 *k, double *selectivity);
+TpQuery *tpquery_copy_with_filter_hint(
+		TpQuery *tpquery, const TpQueryFilterHint *hint, Datum value);
+bool tpquery_get_filter_hint(
+		TpQuery *tpquery, TpQueryFilterHint *hint, Datum *value);
