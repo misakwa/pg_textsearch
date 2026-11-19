@@ -25,6 +25,7 @@
 #include <catalog/pg_opclass.h>
 #include <catalog/pg_operator.h>
 #include <catalog/pg_proc.h>
+#include <catalog/pg_statistic.h>
 #include <catalog/pg_type.h>
 #include <catalog/pg_type_d.h>
 #include <commands/defrem.h>
@@ -50,6 +51,7 @@
 #include <utils/inval.h>
 #include <utils/lsyscache.h>
 #include <utils/rel.h>
+#include <utils/selfuncs.h>
 #include <utils/syscache.h>
 
 #include "compat.h"
@@ -1802,6 +1804,7 @@ tp_find_filter_clause(
 	ListCell *lc;
 	bool	  found	   = false;
 	double	  best_sel = 2.0;
+	Var		 *best_var = NULL;
 
 	foreach (lc, rel->baserestrictinfo)
 	{
@@ -1875,22 +1878,43 @@ tp_find_filter_clause(
 				break;
 
 			memset(hint_out, 0, sizeof(*hint_out));
-			hint_out->btree_oid	  = index->indexoid;
-			hint_out->proc_oid	  = get_opcode(opno);
-			hint_out->subtype	  = righttype;
-			hint_out->collation	  = op->inputcollid;
-			hint_out->typlen	  = cst->constlen;
-			hint_out->typbyval	  = cst->constbyval;
-			hint_out->est_rows	  = sel * rel->tuples;
-			hint_out->selectivity = sel;
-			*value_out			  = cst->constvalue;
+			hint_out->btree_oid = index->indexoid;
+			hint_out->proc_oid	= get_opcode(opno);
+			hint_out->subtype	= righttype;
+			hint_out->collation = op->inputcollid;
+			hint_out->typlen	= cst->constlen;
+			hint_out->typbyval	= cst->constbyval;
+			hint_out->est_rows	= sel * rel->tuples;
+			hint_out->limit_k	= root->limit_tuples;
+			*value_out			= cst->constvalue;
 			if (cst->constlen == -1)
 				*value_out = PointerGetDatum(
 						PG_DETOAST_DATUM_PACKED(cst->constvalue));
 			best_sel = sel;
+			best_var = var;
 			found	 = true;
 			break;
 		}
+	}
+	if (found)
+	{
+		VariableStatData vardata;
+		AttStatsSlot	 sslot;
+
+		examine_variable(root, (Node *)best_var, 0, &vardata);
+		if (HeapTupleIsValid(vardata.statsTuple) &&
+			get_attstatsslot(
+					&sslot,
+					vardata.statsTuple,
+					STATISTIC_KIND_CORRELATION,
+					InvalidOid,
+					ATTSTATSSLOT_NUMBERS))
+		{
+			if (sslot.nnumbers == 1)
+				hint_out->correlation = sslot.numbers[0];
+			free_attstatsslot(&sslot);
+		}
+		ReleaseVariableStats(vardata);
 	}
 	return found;
 }
@@ -1911,7 +1935,7 @@ tp_attach_filter_hints(PlannerInfo *root, RelOptInfo *rel)
 	ListCell		 *lc;
 
 	if (!tp_filter_pushdown || tp_filter_pushdown_max_rows <= 0 ||
-		tp_filter_pushdown_max_share <= 0 || rel->baserestrictinfo == NIL ||
+		tp_filter_pushdown_cost_ratio <= 0 || rel->baserestrictinfo == NIL ||
 		rel->indexlist == NIL)
 		return;
 
@@ -1935,7 +1959,9 @@ tp_attach_filter_hints(PlannerInfo *root, RelOptInfo *rel)
 			have_clause = tp_find_filter_clause(root, rel, &hint, &value);
 			if (have_clause &&
 				(hint.est_rows > tp_filter_pushdown_max_rows ||
-				 hint.selectivity > tp_filter_pushdown_max_share))
+				 hint.est_rows >
+						 tp_filter_pushdown_row_limit(
+								 hint.limit_k, rel->tuples, hint.correlation)))
 				have_clause = false;
 		}
 		if (!have_clause || ipath->indexinfo->relam != oids.bm25_am_oid)

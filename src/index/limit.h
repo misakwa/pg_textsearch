@@ -25,3 +25,5 @@
 extern int tp_default_limit;
 
 int tp_seed_limit_for_filter(int user_limit, double selectivity);
+double
+tp_filter_pushdown_row_limit(double k, double reltuples, double correlation);

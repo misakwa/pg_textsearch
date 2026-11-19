@@ -134,10 +134,10 @@ double tp_filtered_seed_margin = TP_DEFAULT_FILTERED_SEED_MARGIN;
  * Filter pushdown: restrict a BM25 top-k scan to the heap TIDs that an
  * equality clause on a btree's leading column can match.
  */
-bool   tp_filter_pushdown			= true;
-int	   tp_filter_pushdown_max_rows	= TP_DEFAULT_FILTER_PUSHDOWN_MAX_ROWS;
-double tp_filter_pushdown_max_share = TP_DEFAULT_FILTER_PUSHDOWN_MAX_SHARE;
-bool   tp_log_filter_pushdown		= false;
+bool   tp_filter_pushdown			 = true;
+int	   tp_filter_pushdown_max_rows	 = TP_DEFAULT_FILTER_PUSHDOWN_MAX_ROWS;
+double tp_filter_pushdown_cost_ratio = TP_DEFAULT_FILTER_PUSHDOWN_COST_RATIO;
+bool   tp_log_filter_pushdown		 = false;
 
 /*
  * Memtable shared-memory cache enable flag.  Gates the read-path
@@ -713,17 +713,18 @@ _PG_init(void)
 			NULL);
 
 	DefineCustomRealVariable(
-			"pg_textsearch.filter_pushdown_max_share",
-			"Largest fraction of the table a BM25 filter pushdown covers.",
-			"Pushdown costs about the filter's row count, while the "
-			"unfiltered scan gets cheaper as the filter keeps more of the "
-			"table, so above this fraction of the table's rows (estimated "
-			"at planning, counted at execution) the scan ranks the whole "
-			"index.  0 disables pushdown.",
-			&tp_filter_pushdown_max_share,
-			TP_DEFAULT_FILTER_PUSHDOWN_MAX_SHARE,
+			"pg_textsearch.filter_pushdown_cost_ratio",
+			"Cost of ranking one document without BM25 filter pushdown, "
+			"in units of reading one filter row with it.",
+			"Without pushdown the scan ranks about LIMIT * table rows / "
+			"filter rows documents; with it, the cost grows with the "
+			"filter's rows and their spread over the table.  Pushdown is "
+			"used when it is cheaper (estimated at planning, counted at "
+			"execution).  0 disables pushdown.",
+			&tp_filter_pushdown_cost_ratio,
+			TP_DEFAULT_FILTER_PUSHDOWN_COST_RATIO,
 			0.0,
-			1.0,
+			1000000.0,
 			PGC_USERSET,
 			0,
 			NULL,

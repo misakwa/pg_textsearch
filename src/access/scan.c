@@ -149,7 +149,8 @@ tp_scan_filter_reset(TpScanOpaque so)
  * The btree returns dead and invisible entries too, so the set is a
  * superset of the visible matching rows; the executor's Filter rechecks
  * each row.  Any doubt about the btree falls back to the unfiltered scan,
- * and so does a row set above max_rows or above max_share of the table.
+ * and so does a row set above max_rows or above the row count at which
+ * ranking the whole index is expected to be cheaper.
  */
 static void
 tp_scan_build_filter(IndexScanDesc scan, TpScanOpaque so)
@@ -162,7 +163,7 @@ tp_scan_build_filter(IndexScanDesc scan, TpScanOpaque so)
 	ItemPointer		   tid;
 	MemoryContext	   oldcontext;
 	int				   cap		 = tp_filter_pushdown_max_rows;
-	double			   max_share = tp_filter_pushdown_max_share;
+	double			   limit	 = cap;
 	double			   reltuples = 0;
 	double			   rows		 = hint->est_rows;
 	int				   n		 = 0;
@@ -174,14 +175,20 @@ tp_scan_build_filter(IndexScanDesc scan, TpScanOpaque so)
 	so->filter_state = TP_FILTER_FALLBACK;
 	if (heap != NULL)
 		reltuples = heap->rd_rel->reltuples;
+	if (reltuples > 0)
+		limit =
+				Min(limit,
+					tp_filter_pushdown_row_limit(
+							hint->limit_k, reltuples, hint->correlation));
+	else if (tp_filter_pushdown_cost_ratio <= 0)
+		limit = 0;
 
-	if (!tp_filter_pushdown || cap <= 0 || max_share <= 0 || heap == NULL ||
+	if (!tp_filter_pushdown || limit < 1 || heap == NULL ||
 		scan->xs_snapshot == NULL || !IsMVCCSnapshot(scan->xs_snapshot) ||
-		hint->est_rows > cap || hint->selectivity > max_share)
+		hint->est_rows > limit)
 		goto done;
 
-	if (reltuples > 0)
-		cap = (int)Min((double)cap, floor(max_share * reltuples));
+	cap = (int)floor(limit);
 
 	LockRelationOid(hint->btree_oid, AccessShareLock);
 	if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(hint->btree_oid)))
@@ -276,13 +283,12 @@ done:
 				 get_rel_name(hint->btree_oid));
 		else
 			elog(NOTICE,
-				 "BM25 filter pushdown not used (%s %.0f of %.0f rows, "
-				 "limits %d rows and share %g)",
+				 "BM25 filter pushdown not used (%s %.0f rows, limit %.0f "
+				 "of %.0f table rows)",
 				 overflow ? "more than" : "estimated",
 				 overflow ? rows - 1 : rows,
-				 Max(reltuples, 0),
-				 tp_filter_pushdown_max_rows,
-				 max_share);
+				 floor(Max(limit, 0)),
+				 Max(reltuples, 0));
 	}
 }
 
