@@ -415,11 +415,15 @@ DEALLOCATE fp_q;
 RESET plan_cache_mode;
 RESET pg_textsearch.filter_pushdown_max_rows;
 ------------------------------------------------------------------------
--- Fallback by cost.  For grp = 1 (1,400 of 14,000 rows, scattered) the
--- default ratio allows about 3,200 rows at LIMIT 10 but about 750 at
--- LIMIT 1, so only LIMIT 1 ranks the whole index: the planner attaches
--- no filter and no NOTICE appears.  A generic plan made under the
--- default ratio falls back at execution under a tiny one.
+-- Fallback by cost.  grp = 1 is 1,400 of 14,000 rows spread over the
+-- whole table, though ANALYZE reports grp's correlation as 0.82, so the
+-- estimate takes them for partly clustered.  LIMIT 10 keeps pushdown.
+-- LIMIT 1 falls back on the estimate, before the btree read.  At LIMIT 2
+-- the estimate passes, but the rows read span the whole table and a
+-- seeded scan finishes in one pass, so it falls back after the read;
+-- without the seed the scan would re-drive, and pushdown stays.  A
+-- generic plan made under the default ratio falls back at execution
+-- under a tiny one.
 ------------------------------------------------------------------------
 SET client_min_messages = NOTICE;
 SET pg_textsearch.log_filter_pushdown = on;
@@ -435,11 +439,32 @@ NOTICE:  BM25 filter pushdown: 1405 rows from index "fp_docs_grp"
 SELECT count(*) FROM (
     SELECT id FROM fp_docs WHERE grp = 1
     ORDER BY body <@> to_bm25query('w1 w2', 'fp_docs_bm25') LIMIT 1) s;
+NOTICE:  BM25 filter pushdown not used (estimated 1400 rows, limit 991 of 14000 table rows)
  count 
 -------
      1
 (1 row)
 
+SELECT count(*) FROM (
+    SELECT id FROM fp_docs WHERE grp = 1
+    ORDER BY body <@> to_bm25query('w1 w2', 'fp_docs_bm25') LIMIT 2) s;
+NOTICE:  BM25 filter pushdown not used (1405 rows spread over 14000 of 14000 table rows)
+ count 
+-------
+     2
+(1 row)
+
+SET pg_textsearch.filtered_seed = off;
+SELECT count(*) FROM (
+    SELECT id FROM fp_docs WHERE grp = 1
+    ORDER BY body <@> to_bm25query('w1 w2', 'fp_docs_bm25') LIMIT 2) s;
+NOTICE:  BM25 filter pushdown: 1405 rows from index "fp_docs_grp"
+ count 
+-------
+     2
+(1 row)
+
+RESET pg_textsearch.filtered_seed;
 SET client_min_messages = WARNING;
 SELECT fp_check('w1 w2', 'grp = 1', 1) AS cost_fallback;
  cost_fallback 

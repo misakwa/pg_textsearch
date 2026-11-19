@@ -130,10 +130,11 @@ tp_scan_filter_reset(TpScanOpaque so)
 	if (so->filter_state != TP_FILTER_NONE && !so->filter_hint.typbyval &&
 		DatumGetPointer(so->filter_value) != NULL)
 		pfree(DatumGetPointer(so->filter_value));
-	so->filter_ctids = NULL;
-	so->filter_count = 0;
-	so->filter_value = (Datum)0;
-	so->filter_state = TP_FILTER_NONE;
+	so->filter_ctids	= NULL;
+	so->filter_count	= 0;
+	so->filter_value	= (Datum)0;
+	so->filter_state	= TP_FILTER_NONE;
+	so->filter_one_pass = false;
 }
 
 #define ST_SORT			 tp_sort_tid_keys
@@ -149,8 +150,9 @@ tp_scan_filter_reset(TpScanOpaque so)
  * The btree returns dead and invisible entries too, so the set is a
  * superset of the visible matching rows; the executor's Filter rechecks
  * each row.  Any doubt about the btree falls back to the unfiltered scan,
- * and so does a row set above max_rows or above the row count at which
- * ranking the whole index is expected to be cheaper.
+ * and so does a row set above max_rows or one for which ranking the whole
+ * index is expected to be cheaper: first by the planner's estimates, then
+ * by the exact row count and span of the rows read.
  */
 static void
 tp_scan_build_filter(IndexScanDesc scan, TpScanOpaque so)
@@ -169,6 +171,7 @@ tp_scan_build_filter(IndexScanDesc scan, TpScanOpaque so)
 	int				   n		 = 0;
 	int				   alloced	 = 0;
 	bool			   overflow	 = false;
+	double			   span		 = 0;
 	uint64			  *keys		 = NULL;
 	ItemPointer		   tids		 = NULL;
 
@@ -179,7 +182,10 @@ tp_scan_build_filter(IndexScanDesc scan, TpScanOpaque so)
 		limit =
 				Min(limit,
 					tp_filter_pushdown_row_limit(
-							hint->limit_k, reltuples, hint->correlation));
+							hint->limit_k,
+							reltuples,
+							hint->correlation,
+							so->filter_one_pass));
 	else if (tp_filter_pushdown_cost_ratio <= 0)
 		limit = 0;
 
@@ -267,6 +273,28 @@ tp_scan_build_filter(IndexScanDesc scan, TpScanOpaque so)
 						(OffsetNumber)keys[r]);
 		n = w;
 		pfree(keys);
+
+		if (reltuples > 0)
+		{
+			BlockNumber nblocks = RelationGetNumberOfBlocks(heap);
+			double		blocks	= ItemPointerGetBlockNumber(&tids[n - 1]) -
+							ItemPointerGetBlockNumber(&tids[0]) + 1.0;
+
+			span = nblocks > 0 ? Min(1.0, blocks / nblocks) * reltuples
+							   : reltuples;
+			if (!tp_filter_pushdown_cheaper(
+						n,
+						span,
+						hint->limit_k,
+						reltuples,
+						so->filter_one_pass))
+			{
+				pfree(tids);
+				MemoryContextSwitchTo(oldcontext);
+				rows = n;
+				goto done;
+			}
+		}
 	}
 	MemoryContextSwitchTo(oldcontext);
 	so->filter_ctids = tids;
@@ -281,6 +309,13 @@ done:
 				 "BM25 filter pushdown: %d rows from index \"%s\"",
 				 so->filter_count,
 				 get_rel_name(hint->btree_oid));
+		else if (span > 0)
+			elog(NOTICE,
+				 "BM25 filter pushdown not used (%.0f rows spread over %.0f "
+				 "of %.0f table rows)",
+				 rows,
+				 span,
+				 reltuples);
 		else
 			elog(NOTICE,
 				 "BM25 filter pushdown not used (%s %.0f rows, limit %.0f "
@@ -393,7 +428,14 @@ tp_rescan_process_orderby(
 
 					if (tpquery_get_filter_hint(
 								query, &so->filter_hint, &so->filter_value))
+					{
 						so->filter_state = TP_FILTER_PENDING;
+						if (so->limit > hint_k)
+						{
+							so->filter_hint.limit_k = hint_k;
+							so->filter_one_pass		= true;
+						}
+					}
 					MemoryContextSwitchTo(oldcontext);
 				}
 

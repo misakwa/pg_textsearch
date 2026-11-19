@@ -1957,11 +1957,12 @@ tp_attach_filter_hints(PlannerInfo *root, RelOptInfo *rel)
 			if (!get_bm25_oids(&oids))
 				return;
 			have_clause = tp_find_filter_clause(root, rel, &hint, &value);
-			if (have_clause &&
-				(hint.est_rows > tp_filter_pushdown_max_rows ||
-				 hint.est_rows >
-						 tp_filter_pushdown_row_limit(
-								 hint.limit_k, rel->tuples, hint.correlation)))
+			if (have_clause && (hint.est_rows > tp_filter_pushdown_max_rows ||
+								hint.est_rows > tp_filter_pushdown_row_limit(
+														hint.limit_k,
+														rel->tuples,
+														hint.correlation,
+														false)))
 				have_clause = false;
 		}
 		if (!have_clause || ipath->indexinfo->relam != oids.bm25_am_oid)

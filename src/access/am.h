@@ -57,6 +57,7 @@ typedef struct TpScanOpaqueData
 	Datum			  filter_value;
 	ItemPointer		  filter_ctids; /* sorted, unique */
 	int				  filter_count;
+	bool			  filter_one_pass; /* first batch seeded, no re-drive */
 } TpScanOpaqueData;
 
 #define TP_FILTER_NONE	   0 /* no hint */
