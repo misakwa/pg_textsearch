@@ -7,19 +7,26 @@
 #include <postgres.h>
 
 #include <access/genam.h>
+#include <access/nbtree.h>
 #include <access/relscan.h>
 #include <access/sdir.h>
+#include <access/skey.h>
 #include <access/table.h>
 #include <catalog/namespace.h>
+#include <catalog/pg_am_d.h>
 #include <fmgr.h>
+#include <math.h>
 #include <pgstat.h>
 #include <storage/bufmgr.h>
+#include <storage/lmgr.h>
 #include <utils/builtins.h>
 #include <utils/hsearch.h>
 #include <utils/lsyscache.h>
 #include <utils/memutils.h>
 #include <utils/regproc.h>
 #include <utils/rel.h>
+#include <utils/snapmgr.h>
+#include <utils/syscache.h>
 
 #include "access/am.h"
 #include "access/boolean.h"
@@ -29,6 +36,7 @@
 #include "index/resolve.h"
 #include "index/state.h"
 #include "memtable/scan.h"
+#include "segment/io.h"
 #include "types/query.h"
 #include "types/vector.h"
 
@@ -111,6 +119,212 @@ tp_returned_ctids_reset(TpScanOpaque so)
 	{
 		hash_destroy(so->returned_ctids);
 		so->returned_ctids = NULL;
+	}
+}
+
+/* Forget the filter of a previous scan. */
+static void
+tp_scan_filter_reset(TpScanOpaque so)
+{
+	if (so->filter_ctids)
+		pfree(so->filter_ctids);
+	if (so->filter_state != TP_FILTER_NONE && !so->filter_hint.typbyval &&
+		DatumGetPointer(so->filter_value) != NULL)
+		pfree(DatumGetPointer(so->filter_value));
+	so->filter_ctids	= NULL;
+	so->filter_count	= 0;
+	so->filter_value	= (Datum)0;
+	so->filter_state	= TP_FILTER_NONE;
+	so->filter_one_pass = false;
+}
+
+#define ST_SORT			 tp_sort_tid_keys
+#define ST_ELEMENT_TYPE	 uint64
+#define ST_COMPARE(a, b) (*(a) < *(b) ? -1 : *(a) > *(b))
+#define ST_SCOPE		 static
+#define ST_DECLARE
+#define ST_DEFINE
+#include <lib/sort_template.h>
+
+/*
+ * Read the heap TIDs the filter hint's clause can match from its btree.
+ * The btree returns dead and invisible entries too, so the set is a
+ * superset of the visible matching rows; the executor's Filter rechecks
+ * each row.  Any doubt about the btree falls back to the unfiltered scan,
+ * and so does a row set above max_rows or one for which ranking the whole
+ * index is expected to be cheaper: first by the planner's estimates, then
+ * by the exact row count and the segment documents the merge walks.
+ */
+static void
+tp_scan_build_filter(IndexScanDesc scan, TpScanOpaque so)
+{
+	TpQueryFilterHint *hint = &so->filter_hint;
+	Relation		   heap = scan->heapRelation;
+	Relation		   btree;
+	IndexScanDesc	   bscan;
+	ScanKeyData		   key;
+	ItemPointer		   tid;
+	MemoryContext	   oldcontext;
+	int				   cap		 = tp_filter_pushdown_max_rows;
+	double			   limit	 = cap;
+	double			   reltuples = 0;
+	double			   rows		 = hint->est_rows;
+	int				   n		 = 0;
+	int				   alloced	 = 0;
+	bool			   overflow	 = false;
+	double			   walked	 = 0;
+	uint64			  *keys		 = NULL;
+	ItemPointer		   tids		 = NULL;
+
+	so->filter_state = TP_FILTER_FALLBACK;
+	if (heap != NULL)
+		reltuples = heap->rd_rel->reltuples;
+	if (reltuples > 0)
+		limit =
+				Min(limit,
+					tp_filter_pushdown_row_limit(
+							hint->limit_k,
+							reltuples,
+							hint->correlation,
+							so->filter_one_pass));
+	else if (tp_filter_pushdown_cost_ratio <= 0)
+		limit = 0;
+
+	if (!tp_filter_pushdown || limit < 1 || heap == NULL ||
+		scan->xs_snapshot == NULL || !IsMVCCSnapshot(scan->xs_snapshot) ||
+		hint->est_rows > limit)
+		goto done;
+
+	cap = (int)floor(limit);
+
+	LockRelationOid(hint->btree_oid, AccessShareLock);
+	if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(hint->btree_oid)))
+	{
+		UnlockRelationOid(hint->btree_oid, AccessShareLock);
+		goto done;
+	}
+	btree = index_open(hint->btree_oid, NoLock);
+	if (btree->rd_rel->relam != BTREE_AM_OID || btree->rd_index == NULL ||
+		btree->rd_index->indrelid != RelationGetRelid(heap) ||
+		!btree->rd_index->indisvalid || !btree->rd_index->indisready ||
+		btree->rd_index->indnkeyatts < 1)
+	{
+		index_close(btree, NoLock);
+		goto done;
+	}
+
+	ScanKeyEntryInitialize(
+			&key,
+			0,
+			1,
+			BTEqualStrategyNumber,
+			hint->subtype,
+			hint->collation,
+			hint->proc_oid,
+			so->filter_value);
+
+	oldcontext = MemoryContextSwitchTo(so->scan_context);
+#if PG_VERSION_NUM >= 180000
+	bscan = index_beginscan(heap, btree, scan->xs_snapshot, NULL, 1, 0);
+#else
+	bscan = index_beginscan(heap, btree, scan->xs_snapshot, 1, 0);
+#endif
+	index_rescan(bscan, &key, 1, NULL, 0);
+	while ((tid = index_getnext_tid(bscan, ForwardScanDirection)) != NULL)
+	{
+		if (n >= cap)
+		{
+			overflow = true;
+			break;
+		}
+		if (n >= alloced)
+		{
+			alloced = alloced == 0 ? Min(1024, Max(cap, 1))
+								   : Min(alloced * 2, cap);
+			keys	= keys == NULL ? palloc(alloced * sizeof(uint64))
+								   : repalloc(keys, alloced * sizeof(uint64));
+		}
+		keys[n++] = ((uint64)ItemPointerGetBlockNumberNoCheck(tid) << 16) |
+					ItemPointerGetOffsetNumberNoCheck(tid);
+	}
+	index_endscan(bscan);
+	index_close(btree, NoLock);
+
+	if (overflow)
+	{
+		pfree(keys);
+		MemoryContextSwitchTo(oldcontext);
+		rows = n + 1;
+		goto done;
+	}
+
+	if (n > 0)
+	{
+		int w = 1;
+
+		tp_sort_tid_keys(keys, n);
+		tids = palloc(n * sizeof(ItemPointerData));
+		ItemPointerSet(
+				&tids[0], (BlockNumber)(keys[0] >> 16), (OffsetNumber)keys[0]);
+		for (int r = 1; r < n; r++)
+			if (keys[r] != keys[r - 1])
+				ItemPointerSet(
+						&tids[w++],
+						(BlockNumber)(keys[r] >> 16),
+						(OffsetNumber)keys[r]);
+		n = w;
+		pfree(keys);
+
+		if (reltuples > 0)
+		{
+			BlockNumber nblocks = RelationGetNumberOfBlocks(heap);
+
+			walked = nblocks > 0 ? Min(reltuples,
+									   tp_ctid_merge_walked(
+											   tids, n, reltuples / nblocks))
+								 : reltuples;
+			if (!tp_filter_pushdown_cheaper(
+						n,
+						walked,
+						hint->limit_k,
+						reltuples,
+						so->filter_one_pass))
+			{
+				pfree(tids);
+				MemoryContextSwitchTo(oldcontext);
+				rows = n;
+				goto done;
+			}
+		}
+	}
+	MemoryContextSwitchTo(oldcontext);
+	so->filter_ctids = tids;
+	so->filter_count = n;
+	so->filter_state = TP_FILTER_ACTIVE;
+
+done:
+	if (tp_log_filter_pushdown)
+	{
+		if (so->filter_state == TP_FILTER_ACTIVE)
+			elog(NOTICE,
+				 "BM25 filter pushdown: %d rows from index \"%s\"",
+				 so->filter_count,
+				 get_rel_name(hint->btree_oid));
+		else if (walked > 0)
+			elog(NOTICE,
+				 "BM25 filter pushdown not used (%.0f rows walking about %.0f "
+				 "of %.0f table rows)",
+				 rows,
+				 walked,
+				 reltuples);
+		else
+			elog(NOTICE,
+				 "BM25 filter pushdown not used (%s %.0f rows, limit %.0f "
+				 "of %.0f table rows)",
+				 overflow ? "more than" : "estimated",
+				 overflow ? rows - 1 : rows,
+				 floor(Max(limit, 0)),
+				 Max(reltuples, 0));
 	}
 }
 
@@ -209,6 +423,22 @@ tp_rescan_process_orderby(
 				if (tpquery_get_seed_hint(query, &hint_k, &hint_selectivity))
 					so->limit = tp_seed_limit_for_filter(
 							(int)hint_k, hint_selectivity);
+				{
+					MemoryContext oldcontext = MemoryContextSwitchTo(
+							so->scan_context);
+
+					if (tpquery_get_filter_hint(
+								query, &so->filter_hint, &so->filter_value))
+					{
+						so->filter_state = TP_FILTER_PENDING;
+						if (so->limit > hint_k)
+						{
+							so->filter_hint.limit_k = hint_k;
+							so->filter_one_pass		= true;
+						}
+					}
+					MemoryContextSwitchTo(oldcontext);
+				}
 
 				/* Validate index OID if provided in query */
 				if (tpquery_has_index(query))
@@ -340,6 +570,8 @@ tp_rescan(
 		/* Drop the emitted-CTID dedup set from any prior scan */
 		tp_returned_ctids_reset(so);
 
+		tp_scan_filter_reset(so);
+
 		/* Reset scan position and state */
 		so->current_pos	 = 0;
 		so->result_count = 0;
@@ -468,6 +700,10 @@ tp_execute_scoring_query(IndexScanDesc scan)
 				 errmsg("could not get index state for BM25 "
 						"search")));
 	}
+
+	/* Read the btree before taking the index state lock. */
+	if (so->filter_state == TP_FILTER_PENDING)
+		tp_scan_build_filter(scan, so);
 
 	/* Keep the memtable and segment-root snapshot in one index state. */
 	tp_acquire_index_lock(index_state, LW_SHARED);

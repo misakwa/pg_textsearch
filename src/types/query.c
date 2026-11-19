@@ -28,6 +28,7 @@
 #include <nodes/value.h>
 #include <tsearch/ts_type.h>
 #include <utils/builtins.h>
+#include <utils/datum.h>
 #include <utils/fmgroids.h>
 #include <utils/lsyscache.h>
 #include <utils/regproc.h>
@@ -1245,12 +1246,22 @@ tpquery_is_explicit_index(TpQuery *tpquery)
 TpQuery *
 tpquery_copy_with_seed_hint(TpQuery *tpquery, int64 k, double selectivity)
 {
-	Size			old_size = VARSIZE_ANY(tpquery);
-	Size			new_size = old_size + sizeof(TpQuerySeedHint);
+	Size old_size = VARSIZE_ANY(tpquery);
+	Size base	  = offsetof(TpQuery, data) + tpquery->query_text_len + 1;
+	Size head;
+	Size new_size;
 	TpQuerySeedHint hint;
-	TpQuery		   *copy = (TpQuery *)palloc(new_size);
+	TpQuery		   *copy;
 
-	memcpy(copy, tpquery, old_size);
+	/* The seed hint, if any, comes first; a filter hint stays behind it. */
+	head = base;
+	if ((tpquery->flags & TPQUERY_FLAG_SEED_HINT) != 0 &&
+		old_size >= base + sizeof(TpQuerySeedHint))
+		head = base + sizeof(TpQuerySeedHint);
+	new_size = base + sizeof(TpQuerySeedHint) + (old_size - head);
+
+	copy = (TpQuery *)palloc(new_size);
+	memcpy(copy, tpquery, base);
 	SET_VARSIZE(copy, new_size);
 	copy->flags |= TPQUERY_FLAG_SEED_HINT;
 
@@ -1259,7 +1270,10 @@ tpquery_copy_with_seed_hint(TpQuery *tpquery, int64 k, double selectivity)
 	hint.k			 = k;
 	hint.selectivity = selectivity;
 
-	memcpy((char *)copy + old_size, &hint, sizeof(hint));
+	memcpy((char *)copy + base, &hint, sizeof(hint));
+	memcpy((char *)copy + base + sizeof(hint),
+		   (char *)tpquery + head,
+		   old_size - head);
 	return copy;
 }
 
@@ -1279,6 +1293,94 @@ tpquery_get_seed_hint(TpQuery *tpquery, int64 *k, double *selectivity)
 		return false;
 	*k			 = hint.k;
 	*selectivity = hint.selectivity;
+	return true;
+}
+
+static Size
+tpquery_filter_hint_offset(TpQuery *tpquery)
+{
+	Size base = offsetof(TpQuery, data) + tpquery->query_text_len + 1;
+
+	if ((tpquery->flags & TPQUERY_FLAG_SEED_HINT) != 0)
+		base += sizeof(TpQuerySeedHint);
+	return base;
+}
+
+/*
+ * Make a private planner copy carrying a filter pushdown hint.  Like the
+ * seed hint it is an optional trailer, ignored by output and equality.
+ */
+TpQuery *
+tpquery_copy_with_filter_hint(
+		TpQuery *tpquery, const TpQueryFilterHint *hint, Datum value)
+{
+	Size			  base;
+	Size			  new_size;
+	TpQueryFilterHint h = *hint;
+	TpQuery			 *copy;
+
+	if ((tpquery->flags & TPQUERY_FLAG_SEED_HINT) != 0 &&
+		VARSIZE_ANY(tpquery) < offsetof(TpQuery, data) +
+									   tpquery->query_text_len + 1 +
+									   sizeof(TpQuerySeedHint))
+		return tpquery;
+	base = tpquery_filter_hint_offset(tpquery);
+
+	h.magic		= TPQUERY_FILTER_HINT_MAGIC;
+	h.value_len = h.typbyval ? sizeof(Datum)
+							 : datumGetSize(value, h.typbyval, h.typlen);
+	new_size	= base + sizeof(h) + h.value_len;
+
+	copy = (TpQuery *)palloc(new_size);
+	memcpy(copy, tpquery, base);
+	SET_VARSIZE(copy, new_size);
+	copy->flags |= TPQUERY_FLAG_FILTER_HINT;
+	memcpy((char *)copy + base, &h, sizeof(h));
+	if (h.typbyval)
+		memcpy((char *)copy + base + sizeof(h), &value, sizeof(Datum));
+	else
+		memcpy((char *)copy + base + sizeof(h),
+			   DatumGetPointer(value),
+			   h.value_len);
+	return copy;
+}
+
+/*
+ * Read a filter pushdown hint.  A by-reference value is copied into the
+ * current memory context, since the trailer is not aligned.
+ */
+bool
+tpquery_get_filter_hint(
+		TpQuery *tpquery, TpQueryFilterHint *hint, Datum *value)
+{
+	Size  base;
+	Size  size = VARSIZE_ANY(tpquery);
+	char *src;
+
+	if ((tpquery->flags & TPQUERY_FLAG_FILTER_HINT) == 0)
+		return false;
+	base = tpquery_filter_hint_offset(tpquery);
+	if (size < base + sizeof(TpQueryFilterHint))
+		return false;
+	memcpy(hint, (char *)tpquery + base, sizeof(TpQueryFilterHint));
+	if (hint->magic != TPQUERY_FILTER_HINT_MAGIC ||
+		size < base + sizeof(TpQueryFilterHint) + hint->value_len)
+		return false;
+
+	src = (char *)tpquery + base + sizeof(TpQueryFilterHint);
+	if (hint->typbyval)
+	{
+		if (hint->value_len != sizeof(Datum))
+			return false;
+		memcpy(value, src, sizeof(Datum));
+	}
+	else
+	{
+		char *copy = palloc(hint->value_len);
+
+		memcpy(copy, src, hint->value_len);
+		*value = PointerGetDatum(copy);
+	}
 	return true;
 }
 
@@ -1333,9 +1435,8 @@ bm25_textarray_text_score(PG_FUNCTION_ARGS)
 			(errcode(ERRCODE_UNDEFINED_OBJECT),
 			 errmsg("no BM25 index found for text[] <@> text "
 					"expression"),
-			 errdetail(
-					 "Create a BM25 index on the column or "
-					 "use ORDER BY."),
+			 errdetail("Create a BM25 index on the column or "
+					   "use ORDER BY."),
 			 errhint("SELECT col <@> to_bm25query('q', 'idx') "
 					 "AS score")));
 

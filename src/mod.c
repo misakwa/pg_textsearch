@@ -131,6 +131,15 @@ bool   tp_filtered_seed		   = true;
 double tp_filtered_seed_margin = TP_DEFAULT_FILTERED_SEED_MARGIN;
 
 /*
+ * Filter pushdown: restrict a BM25 top-k scan to the heap TIDs that an
+ * equality clause on a btree's leading column can match.
+ */
+bool   tp_filter_pushdown			 = true;
+int	   tp_filter_pushdown_max_rows	 = TP_DEFAULT_FILTER_PUSHDOWN_MAX_ROWS;
+double tp_filter_pushdown_cost_ratio = TP_DEFAULT_FILTER_PUSHDOWN_COST_RATIO;
+bool   tp_log_filter_pushdown		 = false;
+
+/*
  * Memtable shared-memory cache enable flag.  Gates the read-path
  * chooser (tp_memtable_source_create_for_read) on the cache vs
  * the on-disk chain.  Defaults to on: tp_spill_finalize bumps
@@ -250,10 +259,9 @@ acquire_rls_ddl_lock(
 		ereport(ERROR,
 				(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
 				 errmsg("could not acquire the pg_textsearch RLS DDL lock"),
-				 errdetail(
-						 "Protected DDL was invoked from a nested utility "
-						 "command whose outer command does not hold the "
-						 "pg_textsearch DDL lock."),
+				 errdetail("Protected DDL was invoked from a nested utility "
+						   "command whose outer command does not hold the "
+						   "pg_textsearch DDL lock."),
 				 errhint("Retry the outer command.")));
 
 	extension_oid = get_extension_oid("pg_textsearch", true);
@@ -665,6 +673,70 @@ _PG_init(void)
 			TP_DEFAULT_FILTERED_SEED_MARGIN, /* default 3.0 */
 			TP_MIN_FILTERED_SEED_MARGIN,	 /* min 1.0 */
 			TP_MAX_FILTERED_SEED_MARGIN,	 /* max 1000.0 */
+			PGC_USERSET,
+			0,
+			NULL,
+			NULL,
+			NULL);
+
+	DefineCustomBoolVariable(
+			"pg_textsearch.filter_pushdown",
+			"Restrict BM25 top-k scans to rows an equality filter can match.",
+			"When a BM25 index scan has a filter col = constant and col "
+			"leads a btree index of the same table, the scan reads that "
+			"btree once and scores only the rows it lists, instead of "
+			"ranking the whole index and leaving the filter to drop rows. "
+			"Results are identical either way.",
+			&tp_filter_pushdown,
+			true,
+			PGC_USERSET,
+			0,
+			NULL,
+			NULL,
+			NULL);
+
+	DefineCustomIntVariable(
+			"pg_textsearch.filter_pushdown_max_rows",
+			"Largest row set a BM25 filter pushdown reads from the btree.",
+			"A memory bound: the scan keeps 8 bytes per row while it reads "
+			"the btree.  Above this many rows (estimated at planning, "
+			"counted at execution) the scan ranks the whole index as "
+			"without pushdown.  0 disables pushdown.",
+			&tp_filter_pushdown_max_rows,
+			TP_DEFAULT_FILTER_PUSHDOWN_MAX_ROWS,
+			0,
+			INT_MAX / 2,
+			PGC_USERSET,
+			0,
+			NULL,
+			NULL,
+			NULL);
+
+	DefineCustomRealVariable(
+			"pg_textsearch.filter_pushdown_cost_ratio",
+			"Cost of ranking one document without BM25 filter pushdown, "
+			"in units of reading one filter row with it.",
+			"Without pushdown the scan ranks about LIMIT * table rows / "
+			"filter rows documents; with it, the cost grows with the "
+			"filter's rows and their spread over the table.  Pushdown is "
+			"used when it is cheaper (estimated at planning, counted at "
+			"execution).  0 disables pushdown.",
+			&tp_filter_pushdown_cost_ratio,
+			TP_DEFAULT_FILTER_PUSHDOWN_COST_RATIO,
+			0.0,
+			1000000.0,
+			PGC_USERSET,
+			0,
+			NULL,
+			NULL,
+			NULL);
+
+	DefineCustomBoolVariable(
+			"pg_textsearch.log_filter_pushdown",
+			"Report each BM25 filter pushdown decision.",
+			NULL,
+			&tp_log_filter_pushdown,
+			false,
 			PGC_USERSET,
 			0,
 			NULL,
@@ -1443,10 +1515,9 @@ tp_xact_callback(XactEvent event, void *arg pg_attribute_unused())
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("cannot prepare a transaction that dropped a "
 							"pg_textsearch index"),
-					 errdetail(
-							 "Pending index shared-state cleanup is "
-							 "backend-local and cannot be serialized "
-							 "for two-phase commit."),
+					 errdetail("Pending index shared-state cleanup is "
+							   "backend-local and cannot be serialized "
+							   "for two-phase commit."),
 					 errhint("Commit or roll back the DROP INDEX before "
 							 "preparing the transaction.")));
 		if (tp_has_initial_create_ownership())
@@ -1454,10 +1525,9 @@ tp_xact_callback(XactEvent event, void *arg pg_attribute_unused())
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("cannot prepare a transaction that created a "
 							"pg_textsearch index"),
-					 errdetail(
-							 "Initial CREATE INDEX shared-state ownership "
-							 "is backend-local and cannot be serialized "
-							 "for two-phase commit."),
+					 errdetail("Initial CREATE INDEX shared-state ownership "
+							   "is backend-local and cannot be serialized "
+							   "for two-phase commit."),
 					 errhint("Commit or roll back the CREATE INDEX before "
 							 "preparing the transaction.")));
 		/*
@@ -2500,9 +2570,8 @@ tp_reconcile_managed_intents(void)
 						(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
 						 errmsg("could not validate background compaction "
 								"lineage"),
-						 errdetail(
-								 "A requested lineage is concurrently "
-								 "locked."),
+						 errdetail("A requested lineage is concurrently "
+								   "locked."),
 						 errhint("Retry the command after the conflicting "
 								 "transaction completes.")));
 		}
@@ -2644,9 +2713,8 @@ tp_reconcile_managed_intents(void)
 			ereport(WARNING,
 					(errmsg("background compaction lifecycle reconciliation "
 							"was deferred"),
-					 errdetail(
-							 "A required relation or extension object was "
-							 "concurrently locked."),
+					 errdetail("A required relation or extension object was "
+							   "concurrently locked."),
 					 errhint("Repeat the managed DDL after the conflicting "
 							 "transaction completes.")));
 		if (snapshot_pushed)
@@ -3498,9 +3566,8 @@ tp_collect_reindex_state_intents(
 		ereport(WARNING,
 				(errmsg("background compaction lifecycle reconciliation was "
 						"deferred"),
-				 errdetail(
-						 "A published managed index could not be inspected "
-						 "without waiting."),
+				 errdetail("A published managed index could not be inspected "
+						   "without waiting."),
 				 errhint("Repeat the managed DDL after the conflicting "
 						 "transaction completes.")));
 }

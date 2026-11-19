@@ -201,6 +201,13 @@ extern void tp_segment_close(TpSegmentReader *reader);
 extern void tp_segment_lookup_ctid(
 		TpSegmentReader *reader, uint32 doc_id, ItemPointerData *ctid_out);
 extern void tp_segment_enable_ctid_lookup_cache(TpSegmentReader *reader);
+extern double
+tp_ctid_merge_walked(const ItemPointerData *tids, int n, double per_block);
+extern uint32 *tp_segment_doc_ids_for_ctids(
+		TpSegmentReader		  *reader,
+		const ItemPointerData *ctids,
+		int					   nctids,
+		uint32				  *count_out);
 
 /* Zero-copy reader functions */
 typedef struct TpSegmentDirectAccess

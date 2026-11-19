@@ -535,6 +535,425 @@ tp_segment_open_from_buffile(BufFile *file, uint64 base_offset)
 	return reader;
 }
 
+/* First index in ctids[lo, hi) whose CTID is >= (or > when upper) tid. */
+static int
+ctid_array_bound(
+		const ItemPointerData *ctids,
+		int					   lo,
+		int					   hi,
+		ItemPointer			   tid,
+		bool				   upper)
+{
+	while (lo < hi)
+	{
+		int mid = lo + (hi - lo) / 2;
+		int cmp = ItemPointerCompare((ItemPointer)&ctids[mid], tid);
+
+		if (cmp < 0 || (upper && cmp == 0))
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo;
+}
+
+static void tp_segment_read_cached_page(
+		TpSegmentReader *reader,
+		uint64			 logical_offset,
+		void			*dest,
+		uint32			 len,
+		Buffer			*cached_buffer,
+		uint32			*cached_logical_page);
+
+/* Whether doc_id's CTID precedes tid; reads the offset only on a tie. */
+static bool
+segment_ctid_before(TpSegmentReader *reader, uint32 doc_id, ItemPointer tid)
+{
+	BlockNumber	 blk = ItemPointerGetBlockNumberNoCheck(tid);
+	BlockNumber	 page;
+	OffsetNumber offset;
+
+	if (reader->cached_ctid_pages != NULL)
+		return reader->cached_ctid_pages[doc_id] < blk ||
+			   (reader->cached_ctid_pages[doc_id] == blk &&
+				reader->cached_ctid_offsets[doc_id] <
+						ItemPointerGetOffsetNumberNoCheck(tid));
+
+	tp_segment_read_cached_page(
+			reader,
+			reader->header->ctid_pages_offset +
+					(uint64)doc_id * sizeof(BlockNumber),
+			&page,
+			sizeof(BlockNumber),
+			&reader->ctid_pages_buffer,
+			&reader->ctid_pages_logical_page);
+	if (page != blk)
+		return page < blk;
+	tp_segment_read_cached_page(
+			reader,
+			reader->header->ctid_offsets_offset +
+					(uint64)doc_id * sizeof(OffsetNumber),
+			&offset,
+			sizeof(OffsetNumber),
+			&reader->ctid_offsets_buffer,
+			&reader->ctid_offsets_logical_page);
+	return offset < ItemPointerGetOffsetNumberNoCheck(tid);
+}
+
+/* First doc_id in [lo, hi) whose CTID is >= tid, or hi. */
+static uint32
+segment_ctid_bisect(
+		TpSegmentReader *reader, uint32 lo, uint32 hi, ItemPointer tid)
+{
+	while (lo < hi)
+	{
+		uint32 mid = lo + (hi - lo) / 2;
+
+		if (segment_ctid_before(reader, mid, tid))
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo;
+}
+
+/*
+ * First doc_id in [lo, ndocs) whose CTID is >= tid, galloping outward
+ * from guess.  Each probe that leaves the reader's cached CTID page
+ * reads a buffer, so a close guess keeps the search to one or two pages.
+ */
+static uint32
+segment_ctid_lower_bound(
+		TpSegmentReader *reader, uint32 lo, uint32 guess, ItemPointer tid)
+{
+	uint32 hi	= reader->header->num_docs;
+	uint32 step = 1;
+
+	if (lo >= hi)
+		return hi;
+	guess = Min(Max(guess, lo), hi - 1);
+	if (segment_ctid_before(reader, guess, tid))
+	{
+		lo = guess + 1;
+		while (step < hi - lo)
+		{
+			uint32 probe = lo + step - 1;
+
+			if (!segment_ctid_before(reader, probe, tid))
+			{
+				hi = probe;
+				break;
+			}
+			lo = probe + 1;
+			step <<= 1;
+		}
+	}
+	else
+	{
+		hi = guess;
+		while (step < hi - lo)
+		{
+			uint32 probe = hi - step;
+
+			if (segment_ctid_before(reader, probe, tid))
+			{
+				lo = probe + 1;
+				break;
+			}
+			hi = probe;
+			step <<= 1;
+		}
+	}
+	return segment_ctid_bisect(reader, lo, hi, tid);
+}
+
+/* Segment entries expected from heap block from to to's block. */
+static inline double
+ctid_gap(BlockNumber from, const ItemPointerData *to, double per_block)
+{
+	return ((double)ItemPointerGetBlockNumberNoCheck(to) - (double)from) *
+		   per_block;
+}
+
+static inline bool
+ctid_after(const ItemPointerData *tid, BlockNumber blk, OffsetNumber off)
+{
+	BlockNumber b = ItemPointerGetBlockNumberNoCheck(tid);
+
+	return b > blk ||
+		   (b == blk && ItemPointerGetOffsetNumberNoCheck(tid) > off);
+}
+
+/*
+ * Merge sorted TIDs with the segment's CTID arrays read in bulk, starting
+ * at doc_id pos.  Cheaper than galloping once the TIDs are dense, since
+ * each gallop probe is a separate buffer read.  When the next TID is
+ * expected more than MERGE_JUMP entries ahead, at per_block entries per
+ * heap block, a lower-bound search finds it instead of reading the
+ * entries in between, so TIDs stored in runs far apart cost about their
+ * own entries plus one search per run.
+ */
+static uint32
+segment_merge_ctids(
+		TpSegmentReader		  *reader,
+		uint32				   pos,
+		const ItemPointerData *ctids,
+		int					   nctids,
+		double				   per_block,
+		uint32				  *out)
+{
+	uint32		  ndocs		= reader->header->num_docs;
+	bool		  cached	= reader->cached_ctid_pages != NULL;
+	BlockNumber	 *pbuf		= NULL;
+	OffsetNumber *obuf		= NULL;
+	BlockNumber	  seen_blk	= InvalidBlockNumber;
+	uint32		  chunk_len = TP_CTID_MERGE_CHUNK_MIN;
+	uint32		  n			= 0;
+	int			  j			= 0;
+
+	if (!cached)
+	{
+		pbuf = palloc(TP_CTID_MERGE_CHUNK * sizeof(BlockNumber));
+		obuf = palloc(TP_CTID_MERGE_CHUNK * sizeof(OffsetNumber));
+	}
+
+	while (pos < ndocs && j < nctids)
+	{
+		uint32				cnt;
+		const BlockNumber  *pages;
+		const OffsetNumber *offsets;
+		BlockNumber			last_blk;
+		OffsetNumber		last_off;
+		uint32				i	= 0;
+		bool				cut = false;
+
+		if (seen_blk != InvalidBlockNumber &&
+			ctid_gap(seen_blk, &ctids[j], per_block) > TP_CTID_MERGE_JUMP)
+		{
+			double guess = pos + ctid_gap(seen_blk, &ctids[j], per_block);
+
+			pos = segment_ctid_lower_bound(
+					reader,
+					pos,
+					(uint32)Min(guess, (double)ndocs),
+					(ItemPointer)&ctids[j]);
+			seen_blk  = InvalidBlockNumber;
+			chunk_len = TP_CTID_MERGE_CHUNK_MIN;
+			continue;
+		}
+
+		/* Short reads after a jump, since a run may end soon. */
+		cnt		  = Min(chunk_len, ndocs - pos);
+		chunk_len = Min(chunk_len * 2, TP_CTID_MERGE_CHUNK);
+		if (cached)
+		{
+			pages	= reader->cached_ctid_pages + pos;
+			offsets = reader->cached_ctid_offsets + pos;
+		}
+		else
+		{
+			tp_segment_read(
+					reader,
+					reader->header->ctid_pages_offset +
+							(uint64)pos * sizeof(BlockNumber),
+					pbuf,
+					cnt * sizeof(BlockNumber));
+			tp_segment_read(
+					reader,
+					reader->header->ctid_offsets_offset +
+							(uint64)pos * sizeof(OffsetNumber),
+					obuf,
+					cnt * sizeof(OffsetNumber));
+			pages	= pbuf;
+			offsets = obuf;
+		}
+		last_blk = pages[cnt - 1];
+		last_off = offsets[cnt - 1];
+		if (ctid_after(&ctids[j], last_blk, last_off))
+			i = cnt;
+
+		while (i < cnt && j < nctids)
+		{
+			BlockNumber	 blk = ItemPointerGetBlockNumberNoCheck(&ctids[j]);
+			OffsetNumber off = ItemPointerGetOffsetNumberNoCheck(&ctids[j]);
+
+			if (pages[i] < blk || (pages[i] == blk && offsets[i] < off))
+				i++;
+			else
+			{
+				if (pages[i] == blk && offsets[i] == off)
+					out[n++] = pos + i++;
+				j++;
+				if (j == nctids || ctid_after(&ctids[j], last_blk, last_off))
+					break;
+				if (i < cnt && ctid_gap(pages[i], &ctids[j], per_block) >
+									   TP_CTID_MERGE_JUMP)
+				{
+					cut = true;
+					break;
+				}
+			}
+		}
+		if (cut)
+		{
+			seen_blk = pages[i];
+			pos += i;
+		}
+		else
+		{
+			seen_blk = last_blk;
+			pos += cnt;
+		}
+		CHECK_FOR_INTERRUPTS();
+	}
+
+	if (pbuf)
+		pfree(pbuf);
+	if (obuf)
+		pfree(obuf);
+	return n;
+}
+
+/*
+ * Segment entries segment_merge_ctids walks for sorted TIDs, at per_block
+ * entries per heap block between consecutive TIDs.  A gap longer than
+ * MERGE_JUMP costs a jump, about as much as walking MERGE_JUMP entries.
+ */
+double
+tp_ctid_merge_walked(const ItemPointerData *tids, int n, double per_block)
+{
+	double walked = n > 0 ? per_block : 0;
+
+	for (int r = 1; r < n; r++)
+	{
+		BlockNumber prev = ItemPointerGetBlockNumberNoCheck(&tids[r - 1]);
+
+		walked += Min(ctid_gap(prev, &tids[r], per_block), TP_CTID_MERGE_JUMP);
+	}
+	return walked;
+}
+
+/*
+ * Map sorted, unique heap TIDs to this segment's doc_ids, ascending.
+ * Doc_ids are assigned in CTID order (docmap.c, merge.c), so sparse TIDs
+ * gallop over the segment's CTID array in O(log gap) lookups each, and
+ * dense or clustered ones take one merge over the array.
+ * Returns NULL with *count_out = 0 when none of the TIDs is indexed here.
+ */
+uint32 *
+tp_segment_doc_ids_for_ctids(
+		TpSegmentReader		  *reader,
+		const ItemPointerData *ctids,
+		int					   nctids,
+		uint32				  *count_out)
+{
+	uint32			ndocs = reader->header->num_docs;
+	ItemPointerData first;
+	ItemPointerData last;
+	ItemPointerData cur;
+	int				start;
+	int				end;
+	uint32			pos = 0;
+	uint32			n	= 0;
+	uint32		   *out;
+	double			per_block;
+	double			budget;
+
+	*count_out = 0;
+	if (ndocs == 0 || nctids <= 0 || reader->header->ctid_pages_offset == 0)
+		return NULL;
+
+	tp_segment_lookup_ctid(reader, 0, &first);
+	tp_segment_lookup_ctid(reader, ndocs - 1, &last);
+	start = ctid_array_bound(ctids, 0, nctids, &first, false);
+	end	  = ctid_array_bound(ctids, start, nctids, &last, true);
+	if (start >= end)
+		return NULL;
+
+	out		  = palloc((end - start) * sizeof(uint32));
+	per_block = ndocs / (ItemPointerGetBlockNumber(&last) -
+						 ItemPointerGetBlockNumber(&first) + 1.0);
+	budget	  = (double)(end - start) * TP_CTID_GALLOP_RATIO;
+	if (budget >= ndocs ||
+		tp_ctid_merge_walked(ctids + start, end - start, per_block) <= budget)
+	{
+		double guess = ctid_gap(
+				ItemPointerGetBlockNumber(&first), &ctids[start], per_block);
+
+		pos = segment_ctid_lower_bound(
+				reader,
+				0,
+				(uint32)Min(guess, (double)ndocs),
+				(ItemPointer)&ctids[start]);
+		n = segment_merge_ctids(
+				reader, pos, ctids + start, end - start, per_block, out);
+		goto finish;
+	}
+	cur = first;
+	for (int j = start; j < end && pos < ndocs; j++)
+	{
+		ItemPointer target = (ItemPointer)&ctids[j];
+
+		if ((j & 0x3FF) == 0)
+			CHECK_FOR_INTERRUPTS();
+
+		if (ItemPointerCompare(&cur, target) < 0)
+		{
+			uint32 lo	= pos;
+			uint32 hi	= ndocs;
+			uint32 step = 1;
+
+			for (;;)
+			{
+				uint32			probe = lo + step;
+				ItemPointerData c;
+
+				if (probe >= ndocs)
+					break;
+				tp_segment_lookup_ctid(reader, probe, &c);
+				if (ItemPointerCompare(&c, target) >= 0)
+				{
+					hi = probe;
+					break;
+				}
+				lo = probe;
+				step <<= 1;
+			}
+			while (lo + 1 < hi)
+			{
+				uint32			mid = lo + (hi - lo) / 2;
+				ItemPointerData c;
+
+				tp_segment_lookup_ctid(reader, mid, &c);
+				if (ItemPointerCompare(&c, target) < 0)
+					lo = mid;
+				else
+					hi = mid;
+			}
+			pos = hi;
+			if (pos >= ndocs)
+				break;
+			tp_segment_lookup_ctid(reader, pos, &cur);
+		}
+
+		if (ItemPointerEquals(&cur, target))
+		{
+			out[n++] = pos++;
+			if (pos < ndocs)
+				tp_segment_lookup_ctid(reader, pos, &cur);
+		}
+	}
+
+finish:
+	if (n == 0)
+	{
+		pfree(out);
+		return NULL;
+	}
+	*count_out = n;
+	return out;
+}
+
 void
 tp_segment_enable_ctid_lookup_cache(TpSegmentReader *reader)
 {

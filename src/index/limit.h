@@ -24,4 +24,8 @@
 /* Default limit when none detected */
 extern int tp_default_limit;
 
-int tp_seed_limit_for_filter(int user_limit, double selectivity);
+int	   tp_seed_limit_for_filter(int user_limit, double selectivity);
+double tp_filter_pushdown_row_limit(
+		double k, double reltuples, double correlation, bool one_pass);
+bool tp_filter_pushdown_cheaper(
+		double rows, double walked, double k, double reltuples, bool one_pass);

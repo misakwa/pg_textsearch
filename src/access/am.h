@@ -17,6 +17,7 @@
 #include <tsearch/ts_type.h>
 
 #include "index/state.h"
+#include "types/query.h"
 #include "types/vector.h"
 
 /*
@@ -49,7 +50,20 @@ typedef struct TpScanOpaqueData
 
 	/* CTIDs already emitted; used across limit-doubling re-execs. */
 	struct HTAB *returned_ctids;
+
+	/* Filter pushdown (TP_FILTER_*), from the bm25query's filter hint */
+	int				  filter_state;
+	TpQueryFilterHint filter_hint;
+	Datum			  filter_value;
+	ItemPointer		  filter_ctids; /* sorted, unique */
+	int				  filter_count;
+	bool			  filter_one_pass; /* first batch seeded, no re-drive */
 } TpScanOpaqueData;
+
+#define TP_FILTER_NONE	   0 /* no hint */
+#define TP_FILTER_PENDING  1 /* hint read, allow-list not built yet */
+#define TP_FILTER_ACTIVE   2 /* scoring restricted to filter_ctids */
+#define TP_FILTER_FALLBACK 3 /* hint not usable; rank the whole index */
 
 typedef TpScanOpaqueData *TpScanOpaque;
 

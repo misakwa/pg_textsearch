@@ -103,6 +103,27 @@ tp_batch_get_unified_doc_freq(
 			doc_freqs);
 }
 
+bool
+tp_doc_filter_contains(const TpDocFilter *filter, ItemPointer tid)
+{
+	int lo = 0;
+	int hi = filter->count;
+
+	while (lo < hi)
+	{
+		int mid = lo + (hi - lo) / 2;
+		int cmp = ItemPointerCompare((ItemPointer)&filter->ctids[mid], tid);
+
+		if (cmp == 0)
+			return true;
+		if (cmp < 0)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return false;
+}
+
 /*
  * Score documents using BM25 algorithm
  * Returns number of documents scored
@@ -116,7 +137,8 @@ tp_score_documents(
 		int				   query_term_count,
 		int				   max_results,
 		ItemPointer		   result_ctids,
-		float4			 **result_scores)
+		float4			 **result_scores,
+		const TpDocFilter *filter)
 {
 	float4					avg_doc_len;
 	int32					total_docs;
@@ -212,6 +234,7 @@ tp_score_documents(
 				max_results,
 				result_ctids,
 				scores,
+				filter,
 				&stats);
 
 		/* Log BMW stats if enabled */
@@ -289,6 +312,7 @@ tp_score_documents(
 				max_results,
 				result_ctids,
 				scores,
+				filter,
 				&stats);
 
 		pfree(idfs);

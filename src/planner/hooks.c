@@ -12,17 +12,20 @@
 
 #include <access/genam.h>
 #include <access/htup_details.h>
+#include <access/stratnum.h>
 #include <access/table.h>
 #include <access/xact.h>
 #include <catalog/indexing.h>
 #include <catalog/namespace.h>
 #include <catalog/pg_am.h>
+#include <catalog/pg_am_d.h>
 #include <catalog/pg_extension.h>
 #include <catalog/pg_index.h>
 #include <catalog/pg_inherits.h>
 #include <catalog/pg_opclass.h>
 #include <catalog/pg_operator.h>
 #include <catalog/pg_proc.h>
+#include <catalog/pg_statistic.h>
 #include <catalog/pg_type.h>
 #include <catalog/pg_type_d.h>
 #include <commands/defrem.h>
@@ -30,7 +33,9 @@
 #include <limits.h>
 #include <nodes/makefuncs.h>
 #include <nodes/nodeFuncs.h>
+#include <nodes/pathnodes.h>
 #include <nodes/plannodes.h>
+#include <optimizer/cost.h>
 #include <optimizer/optimizer.h>
 #include <optimizer/pathnode.h>
 #include <optimizer/paths.h>
@@ -46,6 +51,7 @@
 #include <utils/inval.h>
 #include <utils/lsyscache.h>
 #include <utils/rel.h>
+#include <utils/selfuncs.h>
 #include <utils/syscache.h>
 
 #include "compat.h"
@@ -778,10 +784,9 @@ transform_tpquery_opexpr(OpExpr *opexpr, ResolveIndexContext *context)
 									"column \"%s\"",
 									index_name ? index_name : "(unknown)",
 									col_name ? col_name : "(unknown)"),
-							 errdetail(
-									 "The explicitly specified "
-									 "index is not built on the "
-									 "column being searched."),
+							 errdetail("The explicitly specified "
+									   "index is not built on the "
+									   "column being searched."),
 							 errhint("Use an index that is built"
 									 " on column \"%s\" of table"
 									 " \"%s\", or omit the index"
@@ -1783,6 +1788,224 @@ fix_bm25_indexpaths(
 }
 
 /*
+ * Find the clause of `rel` best suited to filter pushdown: var = const
+ * on the leading column of a plain btree of the relation, from a clause
+ * without a security level (an RLS policy or security-barrier qual must
+ * keep its place ahead of user clauses).  The executor's Filter still
+ * evaluates every clause, so pushdown only narrows the rows scored.
+ */
+static bool
+tp_find_filter_clause(
+		PlannerInfo		  *root,
+		RelOptInfo		  *rel,
+		TpQueryFilterHint *hint_out,
+		Datum			  *value_out)
+{
+	ListCell *lc;
+	bool	  found	   = false;
+	double	  best_sel = 2.0;
+	Var		 *best_var = NULL;
+
+	foreach (lc, rel->baserestrictinfo)
+	{
+		RestrictInfo *rinfo = (RestrictInfo *)lfirst(lc);
+		OpExpr		 *op;
+		Node		 *left;
+		Node		 *right;
+		Var			 *var;
+		Const		 *cst;
+		Oid			  opno;
+		ListCell	 *ilc;
+
+		if (rinfo->pseudoconstant || rinfo->security_level != 0 ||
+			!IsA(rinfo->clause, OpExpr))
+			continue;
+		op = (OpExpr *)rinfo->clause;
+		if (list_length(op->args) != 2)
+			continue;
+		left  = linitial(op->args);
+		right = lsecond(op->args);
+		opno  = op->opno;
+		if (IsA(left, Const) && IsA(right, Var))
+		{
+			Node *tmp = left;
+
+			left  = right;
+			right = tmp;
+			opno  = get_commutator(opno);
+			if (!OidIsValid(opno))
+				continue;
+		}
+		if (!IsA(left, Var) || !IsA(right, Const))
+			continue;
+		var = (Var *)left;
+		cst = (Const *)right;
+		if (var->varno != (int)rel->relid || var->varlevelsup != 0 ||
+			var->varattno <= 0 || cst->constisnull)
+			continue;
+
+		foreach (ilc, rel->indexlist)
+		{
+			IndexOptInfo *index = (IndexOptInfo *)lfirst(ilc);
+			Oid			  lefttype;
+			Oid			  righttype;
+			int			  strategy;
+			double		  sel;
+
+			if (index->relam != BTREE_AM_OID || index->nkeycolumns < 1 ||
+				index->indexkeys[0] != var->varattno ||
+				(index->indpred != NIL && !index->predOK) ||
+				!index->amhasgettuple)
+				continue;
+			if (OidIsValid(index->indexcollations[0]) &&
+				index->indexcollations[0] != op->inputcollid)
+				continue;
+			if (!op_in_opfamily(opno, index->opfamily[0]))
+				continue;
+			get_op_opfamily_properties(
+					opno,
+					index->opfamily[0],
+					false,
+					&strategy,
+					&lefttype,
+					&righttype);
+			if (strategy != BTEqualStrategyNumber ||
+				righttype != cst->consttype)
+				continue;
+
+			sel = clause_selectivity(root, (Node *)rinfo, 0, JOIN_INNER, NULL);
+			if (found && sel >= best_sel)
+				break;
+
+			memset(hint_out, 0, sizeof(*hint_out));
+			hint_out->btree_oid = index->indexoid;
+			hint_out->proc_oid	= get_opcode(opno);
+			hint_out->subtype	= righttype;
+			hint_out->collation = op->inputcollid;
+			hint_out->typlen	= cst->constlen;
+			hint_out->typbyval	= cst->constbyval;
+			hint_out->est_rows	= sel * rel->tuples;
+			hint_out->limit_k	= root->limit_tuples;
+			*value_out			= cst->constvalue;
+			if (cst->constlen == -1)
+				*value_out = PointerGetDatum(
+						PG_DETOAST_DATUM_PACKED(cst->constvalue));
+			best_sel = sel;
+			best_var = var;
+			found	 = true;
+			break;
+		}
+	}
+	if (found)
+	{
+		VariableStatData vardata;
+		AttStatsSlot	 sslot;
+
+		examine_variable(root, (Node *)best_var, 0, &vardata);
+		if (HeapTupleIsValid(vardata.statsTuple) &&
+			get_attstatsslot(
+					&sslot,
+					vardata.statsTuple,
+					STATISTIC_KIND_CORRELATION,
+					InvalidOid,
+					ATTSTATSSLOT_NUMBERS))
+		{
+			if (sslot.nnumbers == 1)
+				hint_out->correlation = sslot.numbers[0];
+			free_attstatsslot(&sslot);
+		}
+		ReleaseVariableStats(vardata);
+	}
+	return found;
+}
+
+/*
+ * Attach a filter pushdown hint to the bm25query of every BM25 ordered
+ * IndexPath of `rel`.  The path gets its own copy of the ORDER BY
+ * expression: the original belongs to the query's pathkeys.
+ */
+static void
+tp_attach_filter_hints(PlannerInfo *root, RelOptInfo *rel)
+{
+	BM25OidCache	  oids;
+	TpQueryFilterHint hint;
+	Datum			  value;
+	bool			  have_clause = false;
+	bool			  looked	  = false;
+	ListCell		 *lc;
+
+	if (!tp_filter_pushdown || tp_filter_pushdown_max_rows <= 0 ||
+		tp_filter_pushdown_cost_ratio <= 0 || rel->baserestrictinfo == NIL ||
+		rel->indexlist == NIL)
+		return;
+
+	foreach (lc, rel->pathlist)
+	{
+		Path	  *path = (Path *)lfirst(lc);
+		IndexPath *ipath;
+		List	  *orderbys = NIL;
+		ListCell  *olc;
+
+		if (!IsA(path, IndexPath))
+			continue;
+		ipath = (IndexPath *)path;
+		if (ipath->indexorderbys == NIL || ipath->indexclauses != NIL)
+			continue;
+		if (!looked)
+		{
+			looked = true;
+			if (!get_bm25_oids(&oids))
+				return;
+			have_clause = tp_find_filter_clause(root, rel, &hint, &value);
+			if (have_clause && (hint.est_rows > tp_filter_pushdown_max_rows ||
+								hint.est_rows > tp_filter_pushdown_row_limit(
+														hint.limit_k,
+														rel->tuples,
+														hint.correlation,
+														false)))
+				have_clause = false;
+		}
+		if (!have_clause || ipath->indexinfo->relam != oids.bm25_am_oid)
+			continue;
+
+		foreach (olc, ipath->indexorderbys)
+		{
+			Node *expr = (Node *)lfirst(olc);
+
+			if (IsA(expr, OpExpr) &&
+				list_length(((OpExpr *)expr)->args) == 2 &&
+				IsA(lsecond(((OpExpr *)expr)->args), Const))
+			{
+				OpExpr *copy	 = (OpExpr *)copyObject(expr);
+				Const  *original = (Const *)lsecond(copy->args);
+
+				if (original->consttype == oids.tpquery_type_oid &&
+					!original->constisnull)
+				{
+					TpQuery *query = (TpQuery *)DatumGetPointer(
+							original->constvalue);
+					Const *replacement = makeConst(
+							original->consttype,
+							original->consttypmod,
+							original->constcollid,
+							-1,
+							PointerGetDatum(tpquery_copy_with_filter_hint(
+									query, &hint, value)),
+							false,
+							false);
+
+					replacement->location = original->location;
+					lsecond(copy->args)	  = replacement;
+					expr				  = (Node *)copy;
+				}
+			}
+			orderbys = lappend(orderbys, expr);
+		}
+		ipath->indexorderbys = orderbys;
+	}
+}
+
+/*
  * set_rel_pathlist_hook: Replace BM25 IndexPaths that use the wrong index.
  *
  * When a query specifies an explicit BM25 index via to_bm25query(), we need
@@ -1803,6 +2026,11 @@ tp_set_rel_pathlist_hook(
 {
 	if (prev_set_rel_pathlist_hook)
 		prev_set_rel_pathlist_hook(root, rel, rti, rte);
+
+	if (rte->rtekind == RTE_RELATION &&
+		(rel->reloptkind == RELOPT_BASEREL ||
+		 rel->reloptkind == RELOPT_OTHER_MEMBER_REL))
+		tp_attach_filter_hints(root, rel);
 
 	/* Only process base relations */
 	if (rel->reloptkind != RELOPT_BASEREL)
@@ -1893,10 +2121,9 @@ validate_indexscan_explicit_index(IndexScan *indexscan, BM25OidCache *oids)
 							"index \"%s\"",
 							specified_name ? specified_name : "(unknown)",
 							scan_name ? scan_name : "(unknown)"),
-					 errdetail(
-							 "When an explicit index is specified in "
-							 "to_bm25query(), that index must be used for "
-							 "the scan to ensure consistent tokenization."),
+					 errdetail("When an explicit index is specified in "
+							   "to_bm25query(), that index must be used for "
+							   "the scan to ensure consistent tokenization."),
 					 errhint("Use a planner hint to force the specified "
 							 "index, or remove the explicit index name to let "
 							 "the planner choose automatically.")));

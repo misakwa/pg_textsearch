@@ -90,11 +90,18 @@
 #define TP_DEFAULT_B  0.75
 
 /* Memory and capacity limits */
-#define TP_QUERY_LIMITS_HASH_SIZE	   128
-#define TP_DEFAULT_QUERY_LIMIT		   1000
-#define TP_MAX_INITIAL_QUERY_LIMIT	   100000
-#define TP_DEFAULT_SEGMENT_THRESHOLD   10000
-#define TP_DEFAULT_BULK_LOAD_THRESHOLD 100000 /* terms/xact trigger spill */
+#define TP_QUERY_LIMITS_HASH_SIZE			  128
+#define TP_DEFAULT_QUERY_LIMIT				  1000
+#define TP_MAX_INITIAL_QUERY_LIMIT			  100000
+#define TP_DEFAULT_FILTER_PUSHDOWN_MAX_ROWS	  1000000
+#define TP_DEFAULT_FILTER_PUSHDOWN_COST_RATIO 100.0
+#define TP_FILTER_PUSHDOWN_SPAN_COST		  0.08
+#define TP_CTID_MERGE_CHUNK					  2048
+#define TP_CTID_GALLOP_RATIO				  256
+#define TP_CTID_MERGE_CHUNK_MIN				  256
+#define TP_CTID_MERGE_JUMP					  1024
+#define TP_DEFAULT_SEGMENT_THRESHOLD		  10000
+#define TP_DEFAULT_BULK_LOAD_THRESHOLD		  100000 /* terms/xact trigger spill */
 
 /*
  * Selectivity-seeded top-K for filtered BM25 search.  When a filter
@@ -241,6 +248,10 @@ extern int	  tp_segments_per_level;
 extern int	  tp_max_segment_size_mb;
 extern bool	  tp_filtered_seed;
 extern double tp_filtered_seed_margin;
+extern bool	  tp_filter_pushdown;
+extern int	  tp_filter_pushdown_max_rows;
+extern double tp_filter_pushdown_cost_ratio;
+extern bool	  tp_log_filter_pushdown;
 extern bool	  tp_compress_segments;
 extern bool	  tp_memtable_cache_enabled;
 extern bool	  tp_log_cache_state;
