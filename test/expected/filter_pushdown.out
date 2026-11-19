@@ -452,7 +452,7 @@ SHOW pg_textsearch.filter_pushdown;
 SHOW pg_textsearch.filter_pushdown_max_rows;
  pg_textsearch.filter_pushdown_max_rows 
 ----------------------------------------
- 100000
+ 50000
 (1 row)
 
 SET pg_textsearch.filter_pushdown_max_rows = -1;
