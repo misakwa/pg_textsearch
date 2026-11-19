@@ -54,7 +54,8 @@ typedef struct TpQueryFilterHint
 	int16  typlen;		/* of the comparison value */
 	bool   typbyval;	/* of the comparison value */
 	double est_rows;	/* planner estimate of rows matching the clause */
-	double selectivity; /* planner selectivity of the clause */
+	double limit_k;		/* LIMIT plus OFFSET of the query, or -1 */
+	double correlation; /* of the column with the heap order */
 } TpQueryFilterHint;
 
 /*
