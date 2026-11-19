@@ -23,6 +23,18 @@ typedef struct DocumentScoreEntry
 	float4			doc_length;
 } DocumentScoreEntry;
 
+/*
+ * Heap TIDs a filtered scan may return, sorted and unique.  Scoring
+ * skips every other document; NULL means no filter.
+ */
+typedef struct TpDocFilter
+{
+	const ItemPointerData *ctids;
+	int					   count;
+} TpDocFilter;
+
+extern bool tp_doc_filter_contains(const TpDocFilter *filter, ItemPointer tid);
+
 extern int tp_score_documents(
 		TpLocalIndexState *local_state,
 		Relation		   index_relation,
@@ -31,7 +43,8 @@ extern int tp_score_documents(
 		int				   query_term_count,
 		int				   max_results,
 		ItemPointer		   result_ctids,
-		float4			 **result_scores);
+		float4			 **result_scores,
+		const TpDocFilter *filter);
 
 /* IDF calculation */
 extern float4 tp_calculate_idf(int32 doc_freq, int32 total_docs);

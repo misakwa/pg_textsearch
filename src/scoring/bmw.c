@@ -396,6 +396,89 @@ compute_bm25_score(
 }
 
 /*
+ * Allowed doc_ids of one segment, ascending, with a forward cursor.
+ */
+typedef struct TpDocIdSet
+{
+	uint32 *ids;
+	uint32	count;
+	uint32	pos;
+} TpDocIdSet;
+
+/*
+ * Map a scan filter onto a segment.  Returns false when no allowed
+ * document is in the segment, so the caller can skip it.
+ */
+static bool
+docset_init(
+		TpDocIdSet *set, TpSegmentReader *reader, const TpDocFilter *filter)
+{
+	set->ids = tp_segment_doc_ids_for_ctids(
+			reader, filter->ctids, filter->count, &set->count);
+	set->pos = 0;
+	return set->count > 0;
+}
+
+static void
+docset_free(TpDocIdSet *set)
+{
+	if (set->ids)
+		pfree(set->ids);
+	set->ids   = NULL;
+	set->count = 0;
+}
+
+/*
+ * Smallest allowed doc_id >= doc_id, or UINT32_MAX.  Callers ask for
+ * non-decreasing doc_ids, so the cursor only gallops forward; a smaller
+ * request restarts the search from the beginning.
+ */
+static uint32
+docset_seek(TpDocIdSet *set, uint32 doc_id)
+{
+	uint32 lo;
+	uint32 hi;
+	uint32 step = 1;
+
+	if (set->pos > 0 && set->ids[set->pos - 1] >= doc_id)
+		set->pos = 0;
+	if (set->pos >= set->count)
+		return UINT32_MAX;
+	if (set->ids[set->pos] >= doc_id)
+		return set->ids[set->pos];
+
+	lo = set->pos;
+	for (;;)
+	{
+		uint32 probe = lo + step;
+
+		if (probe >= set->count)
+		{
+			hi = set->count;
+			break;
+		}
+		if (set->ids[probe] >= doc_id)
+		{
+			hi = probe;
+			break;
+		}
+		lo = probe;
+		step <<= 1;
+	}
+	while (lo + 1 < hi)
+	{
+		uint32 mid = lo + (hi - lo) / 2;
+
+		if (set->ids[mid] < doc_id)
+			lo = mid;
+		else
+			hi = mid;
+	}
+	set->pos = hi;
+	return hi < set->count ? set->ids[hi] : UINT32_MAX;
+}
+
+/*
  * ------------------------------------------------------------
  * Single-Term BMW Scoring
  * ------------------------------------------------------------
@@ -411,14 +494,15 @@ compute_bm25_score(
  */
 static void
 score_memtable_single_term(
-		TpTopKHeap	 *heap,
-		TpDataSource *source,
-		const char	 *term,
-		float4		  idf,
-		float4		  k1,
-		float4		  b,
-		float4		  avg_doc_len,
-		TpBMWStats	 *stats)
+		TpTopKHeap		  *heap,
+		TpDataSource	  *source,
+		const char		  *term,
+		float4			   idf,
+		float4			   k1,
+		float4			   b,
+		float4			   avg_doc_len,
+		const TpDocFilter *filter,
+		TpBMWStats		  *stats)
 {
 	TpPostingData *postings;
 	int			   i;
@@ -445,6 +529,9 @@ score_memtable_single_term(
 
 		if ((i & 0xFFF) == 0)
 			CHECK_FOR_INTERRUPTS();
+
+		if (filter && !tp_doc_filter_contains(filter, ctid))
+			continue;
 
 		/* Get document length */
 		doc_len = tp_source_get_doc_length(source, ctid);
@@ -475,6 +562,7 @@ score_segment_single_term_bmw(
 		float4			 k1,
 		float4			 b,
 		float4			 avg_doc_len,
+		TpDocIdSet		*allowed,
 		TpBMWStats		*stats)
 {
 	TpSegmentPostingIterator iter;
@@ -482,6 +570,7 @@ score_segment_single_term_bmw(
 	TpDictEntry				*dict_entry;
 	uint32					 block_count;
 	float4					*block_max_scores;
+	uint32					*block_last_doc_ids = NULL;
 	uint32					 i;
 
 	/* Initialize iterator for this term */
@@ -494,6 +583,8 @@ score_segment_single_term_bmw(
 
 	/* Pre-compute block max scores */
 	block_max_scores = palloc(block_count * sizeof(float4));
+	if (allowed)
+		block_last_doc_ids = palloc(block_count * sizeof(uint32));
 	for (i = 0; i < block_count; i++)
 	{
 		TpSkipEntry skip;
@@ -501,6 +592,8 @@ score_segment_single_term_bmw(
 				reader, dict_entry->skip_index_offset, i, &skip);
 		block_max_scores[i] =
 				tp_compute_block_max_score(&skip, idf, k1, b, avg_doc_len);
+		if (block_last_doc_ids)
+			block_last_doc_ids[i] = skip.last_doc_id;
 	}
 
 	/* Process blocks with BMW */
@@ -517,6 +610,22 @@ score_segment_single_term_bmw(
 			if (stats)
 				stats->blocks_skipped++;
 			continue;
+		}
+
+		/* Skip block if it holds no allowed document */
+		if (allowed)
+		{
+			uint32 next = docset_seek(
+					allowed, i == 0 ? 0 : block_last_doc_ids[i - 1] + 1);
+
+			if (next == UINT32_MAX)
+				break;
+			if (next > block_last_doc_ids[i])
+			{
+				if (stats)
+					stats->blocks_skipped++;
+				continue;
+			}
 		}
 
 		if (stats)
@@ -538,6 +647,10 @@ score_segment_single_term_bmw(
 			 */
 			if (iter.current_block != i)
 				break;
+
+			if (allowed &&
+				docset_seek(allowed, posting->doc_id) != posting->doc_id)
+				continue;
 
 			/* Skip dead docs */
 			if (!tp_segment_is_alive(reader, posting->doc_id))
@@ -567,6 +680,8 @@ score_segment_single_term_bmw(
 	}
 
 	pfree(block_max_scores);
+	if (block_last_doc_ids)
+		pfree(block_last_doc_ids);
 	tp_segment_posting_iterator_free(&iter);
 }
 
@@ -584,6 +699,7 @@ tp_score_single_term_bmw(
 		int							  max_results,
 		ItemPointerData				 *result_ctids,
 		float4						 *result_scores,
+		const TpDocFilter			 *filter,
 		TpBMWStats					 *stats)
 {
 	TpTopKHeap heap;
@@ -600,7 +716,7 @@ tp_score_single_term_bmw(
 
 	/* Score memtable (exhaustive - no skip index) */
 	score_memtable_single_term(
-			&heap, memtable_src, term, idf, k1, b, avg_doc_len, stats);
+			&heap, memtable_src, term, idf, k1, b, avg_doc_len, filter, stats);
 
 	/* Score each segment level with BMW */
 	for (uint32 level = 0; level < TP_MAX_LEVELS; level++)
@@ -612,11 +728,34 @@ tp_score_single_term_bmw(
 		for (uint32 root_idx = 0; root_idx < root_count; root_idx++)
 		{
 			TpSegmentReader *reader = tp_segment_open(index, roots[root_idx]);
+			TpDocIdSet		 allowed;
 
 			CHECK_FOR_INTERRUPTS();
 
-			score_segment_single_term_bmw(
-					&heap, reader, term, idf, k1, b, avg_doc_len, stats);
+			if (filter == NULL)
+				score_segment_single_term_bmw(
+						&heap,
+						reader,
+						term,
+						idf,
+						k1,
+						b,
+						avg_doc_len,
+						NULL,
+						stats);
+			else if (docset_init(&allowed, reader, filter))
+				score_segment_single_term_bmw(
+						&heap,
+						reader,
+						term,
+						idf,
+						k1,
+						b,
+						avg_doc_len,
+						&allowed,
+						stats);
+			if (filter)
+				docset_free(&allowed);
 
 			tp_segment_close(reader);
 		}
@@ -688,14 +827,15 @@ term_current_doc_id(TpTermState *ts)
  */
 static void
 score_memtable_multi_term(
-		TpTopKHeap	 *heap,
-		TpDataSource *source,
-		TpTermState **terms,
-		int			  term_count,
-		float4		  k1,
-		float4		  b,
-		float4		  avg_doc_len,
-		TpBMWStats	 *stats)
+		TpTopKHeap		  *heap,
+		TpDataSource	  *source,
+		TpTermState		 **terms,
+		int				   term_count,
+		float4			   k1,
+		float4			   b,
+		float4			   avg_doc_len,
+		const TpDocFilter *filter,
+		TpBMWStats		  *stats)
 {
 	HTAB   *doc_accum;
 	HASHCTL hash_ctl;
@@ -742,6 +882,9 @@ score_memtable_multi_term(
 			 * amortizes the overhead. */
 			if ((i & 0xFFF) == 0)
 				CHECK_FOR_INTERRUPTS();
+
+			if (filter && !tp_doc_filter_contains(filter, ctid))
+				continue;
 
 			/* Get document length */
 			doc_len = tp_source_get_doc_length(source, ctid);
@@ -1480,6 +1623,7 @@ score_segment_multi_term_bmw(
 		float4			 k1,
 		float4			 b,
 		float4			 avg_doc_len,
+		TpDocIdSet		*allowed,
 		TpBMWStats		*stats)
 {
 	int active_count;
@@ -1514,6 +1658,30 @@ score_segment_multi_term_bmw(
 		if (!find_wand_pivot(
 					terms, term_count, threshold, &pivot_len, &pivot_doc_id))
 			break; /* No term combination can beat threshold */
+
+		/*
+		 * No document before the pivot can beat the threshold, and none
+		 * between the pivot and the next allowed document may be
+		 * returned, so every term can move on to that document.
+		 */
+		if (allowed)
+		{
+			uint32 target = docset_seek(allowed, pivot_doc_id);
+
+			if (target == UINT32_MAX)
+				break;
+			if (target > pivot_doc_id)
+			{
+				for (i = 0; i < term_count; i++)
+				{
+					if (term_current_doc_id(terms[i]) < target &&
+						!seek_term_to_doc(terms[i], target))
+						active_count--;
+				}
+				sort_terms_by_doc_id(terms, term_count);
+				continue;
+			}
+		}
 
 		/* Step 2: Seek pre-pivot terms to pivot_doc_id */
 		if (!seek_to_pivot(
@@ -1633,6 +1801,7 @@ tp_score_multi_term_bmw(
 		int							  max_results,
 		ItemPointerData				 *result_ctids,
 		float4						 *result_scores,
+		const TpDocFilter			 *filter,
 		TpBMWStats					 *stats)
 {
 	TpTopKHeap	  heap;
@@ -1666,7 +1835,15 @@ tp_score_multi_term_bmw(
 
 	/* Score memtable (exhaustive - no skip index) */
 	score_memtable_multi_term(
-			&heap, memtable_src, terms, term_count, k1, b, avg_doc_len, stats);
+			&heap,
+			memtable_src,
+			terms,
+			term_count,
+			k1,
+			b,
+			avg_doc_len,
+			filter,
+			stats);
 
 	/* Score each segment with block-based BMW */
 	for (uint32 level = 0; level < TP_MAX_LEVELS; level++)
@@ -1678,19 +1855,27 @@ tp_score_multi_term_bmw(
 		for (uint32 root_idx = 0; root_idx < root_count; root_idx++)
 		{
 			TpSegmentReader *reader = tp_segment_open(index, roots[root_idx]);
+			TpDocIdSet		 allowed;
+			bool			 any = true;
 
 			CHECK_FOR_INTERRUPTS();
 
-			score_segment_multi_term_bmw(
-					&heap,
-					reader,
-					terms,
-					query_order,
-					term_count,
-					k1,
-					b,
-					avg_doc_len,
-					stats);
+			if (filter)
+				any = docset_init(&allowed, reader, filter);
+			if (any)
+				score_segment_multi_term_bmw(
+						&heap,
+						reader,
+						terms,
+						query_order,
+						term_count,
+						k1,
+						b,
+						avg_doc_len,
+						filter ? &allowed : NULL,
+						stats);
+			if (filter)
+				docset_free(&allowed);
 
 			tp_segment_close(reader);
 		}

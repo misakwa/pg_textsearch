@@ -32,6 +32,7 @@ tp_memtable_search(
 		TpVector		  *query_vector)
 {
 	TpScanOpaque  so = (TpScanOpaque)scan->opaque;
+	TpDocFilter	  filter;
 	int			  max_results;
 	int			  result_count = 0;
 	MemoryContext oldcontext;
@@ -51,6 +52,10 @@ tp_memtable_search(
 		max_results = so->limit;
 	else
 		max_results = tp_default_limit;
+
+	/* A filtered scan cannot return more rows than it allows. */
+	if (so->filter_state == TP_FILTER_ACTIVE)
+		max_results = Min(max_results, so->filter_count + 1);
 
 	if ((Size)max_results > MaxAllocSize / sizeof(ItemPointerData))
 		ereport(ERROR,
@@ -92,6 +97,12 @@ tp_memtable_search(
 	Assert(query_frequencies != NULL);
 	Assert(so->result_ctids != NULL);
 
+	if (so->filter_state == TP_FILTER_ACTIVE)
+	{
+		filter.ctids = so->filter_ctids;
+		filter.count = so->filter_count;
+	}
+
 	/* Score documents using the unified scoring function */
 	result_count = tp_score_documents(
 			index_state,
@@ -101,7 +112,8 @@ tp_memtable_search(
 			entry_count,
 			max_results,
 			so->result_ctids,
-			&so->result_scores);
+			&so->result_scores,
+			so->filter_state == TP_FILTER_ACTIVE ? &filter : NULL);
 
 	so->result_count	 = result_count;
 	so->current_pos		 = 0;
