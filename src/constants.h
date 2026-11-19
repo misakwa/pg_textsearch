@@ -98,6 +98,8 @@
 #define TP_FILTER_PUSHDOWN_SPAN_COST		  0.08
 #define TP_CTID_MERGE_CHUNK					  2048
 #define TP_CTID_GALLOP_RATIO				  256
+#define TP_CTID_MERGE_CHUNK_MIN				  256
+#define TP_CTID_MERGE_JUMP					  1024
 #define TP_DEFAULT_SEGMENT_THRESHOLD		  10000
 #define TP_DEFAULT_BULK_LOAD_THRESHOLD		  100000 /* terms/xact trigger spill */
 

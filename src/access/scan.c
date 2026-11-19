@@ -36,6 +36,7 @@
 #include "index/resolve.h"
 #include "index/state.h"
 #include "memtable/scan.h"
+#include "segment/io.h"
 #include "types/query.h"
 #include "types/vector.h"
 
@@ -152,7 +153,7 @@ tp_scan_filter_reset(TpScanOpaque so)
  * each row.  Any doubt about the btree falls back to the unfiltered scan,
  * and so does a row set above max_rows or one for which ranking the whole
  * index is expected to be cheaper: first by the planner's estimates, then
- * by the exact row count and span of the rows read.
+ * by the exact row count and the segment documents the merge walks.
  */
 static void
 tp_scan_build_filter(IndexScanDesc scan, TpScanOpaque so)
@@ -171,7 +172,7 @@ tp_scan_build_filter(IndexScanDesc scan, TpScanOpaque so)
 	int				   n		 = 0;
 	int				   alloced	 = 0;
 	bool			   overflow	 = false;
-	double			   span		 = 0;
+	double			   walked	 = 0;
 	uint64			  *keys		 = NULL;
 	ItemPointer		   tids		 = NULL;
 
@@ -277,14 +278,14 @@ tp_scan_build_filter(IndexScanDesc scan, TpScanOpaque so)
 		if (reltuples > 0)
 		{
 			BlockNumber nblocks = RelationGetNumberOfBlocks(heap);
-			double		blocks	= ItemPointerGetBlockNumber(&tids[n - 1]) -
-							ItemPointerGetBlockNumber(&tids[0]) + 1.0;
 
-			span = nblocks > 0 ? Min(1.0, blocks / nblocks) * reltuples
-							   : reltuples;
+			walked = nblocks > 0 ? Min(reltuples,
+									   tp_ctid_merge_walked(
+											   tids, n, reltuples / nblocks))
+								 : reltuples;
 			if (!tp_filter_pushdown_cheaper(
 						n,
-						span,
+						walked,
 						hint->limit_k,
 						reltuples,
 						so->filter_one_pass))
@@ -309,12 +310,12 @@ done:
 				 "BM25 filter pushdown: %d rows from index \"%s\"",
 				 so->filter_count,
 				 get_rel_name(hint->btree_oid));
-		else if (span > 0)
+		else if (walked > 0)
 			elog(NOTICE,
-				 "BM25 filter pushdown not used (%.0f rows spread over %.0f "
+				 "BM25 filter pushdown not used (%.0f rows walking about %.0f "
 				 "of %.0f table rows)",
 				 rows,
-				 span,
+				 walked,
 				 reltuples);
 		else
 			elog(NOTICE,

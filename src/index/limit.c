@@ -26,9 +26,9 @@ tp_seed_limit_for_filter(int user_limit, double selectivity)
  * documents to find k filter rows, twice as many when it re-drives (each
  * pass doubles the batch and starts over); only a seeded scan finishes in
  * one pass.  Pushdown costs one unit per filter row plus SPAN_COST per
- * segment document between the filter's first and last row, which the
- * CTID merge walks.  cost_ratio prices one ranked document in those units,
- * so pushdown wins while rows * (rows + SPAN_COST * span) <= budget.
+ * segment document the CTID merge walks.  cost_ratio prices one ranked
+ * document in those units, so pushdown wins while
+ * rows * (rows + SPAN_COST * walked) <= budget.
  */
 static double
 tp_filter_pushdown_budget(double k, double reltuples, bool one_pass)
@@ -57,11 +57,11 @@ tp_filter_pushdown_row_limit(
 	return (sqrt(b * b + 4.0 * a * c) - b) / (2.0 * a);
 }
 
-/* The rule with the row count and span known after the btree read. */
+/* The rule with the row count and walked documents known after the read. */
 bool
 tp_filter_pushdown_cheaper(
-		double rows, double span, double k, double reltuples, bool one_pass)
+		double rows, double walked, double k, double reltuples, bool one_pass)
 {
-	return rows * (rows + TP_FILTER_PUSHDOWN_SPAN_COST * span) <=
+	return rows * (rows + TP_FILTER_PUSHDOWN_SPAN_COST * walked) <=
 		   tp_filter_pushdown_budget(k, reltuples, one_pass);
 }
