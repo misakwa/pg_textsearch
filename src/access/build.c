@@ -706,7 +706,7 @@ tp_auto_spill_if_needed(TpLocalIndexState *index_state, Relation index_rel)
 }
 
 /*
- * Flush build context to a segment and link as L0 chain head.
+ * Flush build context to a segment and link it at its size level.
  * Used during serial CREATE INDEX with arena-based build.
  */
 static void
@@ -718,53 +718,54 @@ tp_build_flush_and_link(TpBuildContext *ctx, Relation index)
 	if (segment_root == InvalidBlockNumber)
 		return;
 
-	tp_link_l0_chain_head(index, segment_root);
+	tp_link_build_segment(index, segment_root);
 }
 
 /*
- * Link a newly-written segment as the L0 chain head.
- *
- * Reads the metapage, points the new segment's next_segment at the
- * current L0 head, then updates the metapage head and count.
+ * Link a CREATE INDEX segment at its size level, as compaction places
+ * merged outputs, so the first level-0 pass does not rewrite it.
  */
 void
-tp_link_l0_chain_head(Relation index, BlockNumber segment_root)
+tp_link_build_segment(Relation index, BlockNumber segment_root)
 {
 	Buffer			  metabuf;
-	Buffer			  seg_buf = InvalidBuffer;
+	Buffer			  seg_buf;
 	GenericXLogState *state;
 	Page			  metapage;
+	Page			  seg_page;
 	TpIndexMetaPage	  metap;
+	TpSegmentHeader	 *seg_header;
+	uint32			  level;
 
 	metabuf = ReadBuffer(index, TP_METAPAGE_BLKNO);
 	LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+	seg_buf = ReadBuffer(index, segment_root);
+	LockBuffer(seg_buf, BUFFER_LOCK_EXCLUSIVE);
 
 	state	 = GenericXLogStart(index);
 	metapage = GenericXLogRegisterBuffer(state, metabuf, 0);
 	metap	 = (TpIndexMetaPage)PageGetContents(metapage);
+	seg_page = GenericXLogRegisterBuffer(state, seg_buf, 0);
+	/* Ensure pd_lower covers content for GenericXLog */
+	((PageHeader)seg_page)->pd_lower = BLCKSZ;
+	seg_header = (TpSegmentHeader *)PageGetContents(seg_page);
 
-	tp_check_level_count_increment(metap, 0);
+	if (seg_header->magic != TP_SEGMENT_MAGIC)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("invalid built segment at block %u", segment_root)));
 
-	if (metap->level_heads[0] != InvalidBlockNumber)
-	{
-		Page			 seg_page;
-		TpSegmentHeader *seg_header;
+	level = tp_size_class((uint64)seg_header->num_pages * BLCKSZ);
+	tp_check_level_count_increment(metap, level);
 
-		seg_buf = ReadBuffer(index, segment_root);
-		LockBuffer(seg_buf, BUFFER_LOCK_EXCLUSIVE);
-		seg_page = GenericXLogRegisterBuffer(state, seg_buf, 0);
-		/* Ensure pd_lower covers content for GenericXLog */
-		((PageHeader)seg_page)->pd_lower = BLCKSZ;
-		seg_header = (TpSegmentHeader *)PageGetContents(seg_page);
-		seg_header->next_segment = metap->level_heads[0];
-	}
+	seg_header->level		 = level;
+	seg_header->next_segment = metap->level_heads[level];
 
-	metap->level_heads[0] = segment_root;
-	metap->level_counts[0]++;
+	metap->level_heads[level] = segment_root;
+	metap->level_counts[level]++;
 
 	GenericXLogFinish(state);
-	if (BufferIsValid(seg_buf))
-		UnlockReleaseBuffer(seg_buf);
+	UnlockReleaseBuffer(seg_buf);
 	UnlockReleaseBuffer(metabuf);
 }
 

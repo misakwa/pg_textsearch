@@ -306,7 +306,10 @@ session holds it.
 Count-triggered compaction remains available at `segments_per_level`.
 Merged outputs use their estimated surviving size for placement, with L1 as
 the minimum destination; small outputs no longer climb a level on every
-merge. Capacity-driven singleton promotion remains an exception.
+merge. Capacity-driven singleton promotion remains an exception. `CREATE INDEX`
+links each segment it writes at its size level the same way, with L0 as the
+minimum, so the first count-triggered pass after a build merges spills
+instead of rewriting the build's output.
 
 Below the count threshold, a segment with at least 50% dead documents can
 be rewritten alone. This also works inside a level's chain, retaining its

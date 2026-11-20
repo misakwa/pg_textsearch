@@ -28,6 +28,7 @@ extern void
 tp_compaction_allocation_injection_point(TpCompactionAllocationPhase phase);
 
 extern uint64 tp_max_segment_size_bytes(void);
+extern uint32 tp_size_class(uint64 bytes);
 
 extern void tp_compaction_lock(Relation index);
 extern bool tp_try_compaction_lock(Relation index);

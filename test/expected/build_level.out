@@ -1,0 +1,137 @@
+-- CREATE INDEX links each segment it writes at its size level, so level 0
+-- holds only spills and the first count-triggered pass leaves the build's
+-- output alone.
+CREATE EXTENSION IF NOT EXISTS pg_textsearch;
+\pset format unaligned
+SET client_min_messages = warning;
+SET pg_textsearch.memtable_pages_threshold = 0;
+SET pg_textsearch.bulk_load_threshold = 0;
+SET maintenance_work_mem = '256MB';
+CREATE FUNCTION build_level_segments(idx text)
+RETURNS TABLE (level int, block bigint, bytes bigint) AS $$
+    SELECT m[1]::int, m[2]::bigint,
+           m[3]::bigint * current_setting('block_size')::bigint
+    FROM regexp_matches(bm25_summarize_index(idx),
+                        'L(\d+) Segment \d+: block=(\d+), pages=(\d+)',
+                        'g') AS m
+$$ LANGUAGE sql;
+-- The size limit of level 0: 8 MB, pg_textsearch's base level size.
+CREATE FUNCTION build_level_oversized_l0(idx text) RETURNS bigint AS $$
+    SELECT count(*) FROM build_level_segments(idx)
+    WHERE level = 0 AND bytes > 8 * 1024 * 1024
+$$ LANGUAGE sql;
+-- A build that fits level 0 stays there.
+CREATE TABLE build_level_small (id integer, body text);
+INSERT INTO build_level_small
+SELECT n, 'small document ' || n FROM generate_series(1, 1000) n;
+CREATE INDEX build_level_small_idx ON build_level_small USING bm25(body)
+    WITH (text_config = 'simple');
+SELECT bm25_level_counts('build_level_small_idx') AS small_build_levels;
+small_build_levels
+{1,0,0,0,0,0,0,0}
+(1 row)
+-- 100,000 documents with four unique terms each give a segment well over
+-- level 0's size.
+CREATE TABLE build_level_large (id integer, body text);
+INSERT INTO build_level_large
+SELECT n, 'common ' || md5(n::text) || ' ' || md5((n + 1000000)::text) || ' '
+          || md5((n + 2000000)::text) || ' ' || md5((n + 3000000)::text)
+FROM generate_series(1, 100000) n;
+ANALYZE build_level_large;
+SET max_parallel_maintenance_workers = 0;
+CREATE INDEX build_level_serial_idx ON build_level_large USING bm25(body)
+    WITH (text_config = 'simple', compaction = 'manual');
+SELECT build_level_oversized_l0('build_level_serial_idx') AS serial_oversized_l0,
+       (bm25_level_counts('build_level_serial_idx'))[1] AS serial_l0_count,
+       (SELECT count(*) FROM build_level_segments('build_level_serial_idx')
+        WHERE level > 0) AS serial_placed_segments;
+serial_oversized_l0|serial_l0_count|serial_placed_segments
+0|0|1
+(1 row)
+SELECT id AS serial_match FROM build_level_large
+ORDER BY body <@> to_bm25query(md5('4242'), 'build_level_serial_idx')
+LIMIT 1;
+serial_match
+4242
+(1 row)
+-- Seven spills and a build segment at level 0 would fill it; the pass must
+-- merge only the spills and keep the build's segment where it is.
+CREATE TEMP TABLE build_level_before AS
+SELECT level, block FROM build_level_segments('build_level_serial_idx');
+DO $$
+BEGIN
+    FOR batch IN 1..7 LOOP
+        INSERT INTO build_level_large
+        SELECT 100000 + batch * 10 + n, 'common spill ' || batch
+        FROM generate_series(1, 10) n;
+        PERFORM bm25_spill_index('build_level_serial_idx');
+    END LOOP;
+END
+$$;
+SELECT (bm25_level_counts('build_level_serial_idx'))[1] AS l0_after_spills,
+       bm25_needs_compaction('build_level_serial_idx') AS needs_compaction;
+l0_after_spills|needs_compaction
+7|t
+(1 row)
+SELECT bm25_compact('build_level_serial_idx');
+bm25_compact
+
+(1 row)
+SELECT (bm25_level_counts('build_level_serial_idx'))[1] AS l0_after_compact,
+       (SELECT count(*) FROM build_level_before b
+        JOIN build_level_segments('build_level_serial_idx') a USING (level, block))
+           = (SELECT count(*) FROM build_level_before) AS build_segment_kept;
+l0_after_compact|build_segment_kept
+0|t
+(1 row)
+SELECT count(*) AS common_matches FROM (
+    SELECT id FROM build_level_large
+    ORDER BY body <@> to_bm25query('common', 'build_level_serial_idx')
+    LIMIT 200000) ranked;
+common_matches
+100070
+(1 row)
+-- The parallel leader's merged segment is placed the same way.
+DELETE FROM build_level_large WHERE id > 100000;
+ALTER TABLE build_level_large SET (parallel_workers = 2);
+SET max_parallel_maintenance_workers = 2;
+SET min_parallel_table_scan_size = 0;
+SET client_min_messages = notice;
+CREATE INDEX build_level_parallel_idx ON build_level_large USING bm25(body)
+    WITH (text_config = 'simple', compaction = 'manual');
+NOTICE:  BM25 index build started for relation build_level_parallel_idx
+NOTICE:  Using text search configuration: simple
+NOTICE:  Using index options: k1=1.20, b=0.75
+NOTICE:  parallel index build: launched 2 of 2 requested workers
+NOTICE:  BM25 index build completed: 100000 documents, avg_length=5.26
+SET client_min_messages = warning;
+SELECT build_level_oversized_l0('build_level_parallel_idx') AS parallel_oversized_l0,
+       (bm25_level_counts('build_level_parallel_idx'))[1] AS parallel_l0_count,
+       (SELECT count(*) FROM build_level_segments('build_level_parallel_idx')
+        WHERE level > 0) AS parallel_placed_segments;
+parallel_oversized_l0|parallel_l0_count|parallel_placed_segments
+0|0|1
+(1 row)
+SELECT id AS parallel_match FROM build_level_large
+ORDER BY body <@> to_bm25query(md5('1004242'), 'build_level_parallel_idx')
+LIMIT 1;
+parallel_match
+4242
+(1 row)
+SELECT bm25_force_merge('build_level_parallel_idx');
+bm25_force_merge
+
+(1 row)
+SELECT sum(n) AS segments_after_force_merge
+FROM unnest(bm25_level_counts('build_level_parallel_idx')) n;
+segments_after_force_merge
+1
+(1 row)
+DROP TABLE build_level_large;
+DROP TABLE build_level_small;
+DROP FUNCTION build_level_oversized_l0(text);
+DROP FUNCTION build_level_segments(text);
+RESET maintenance_work_mem;
+RESET pg_textsearch.memtable_pages_threshold;
+RESET pg_textsearch.bulk_load_threshold;
+DROP EXTENSION pg_textsearch CASCADE;

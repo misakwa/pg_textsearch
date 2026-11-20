@@ -606,7 +606,7 @@ tp_collect_force_sources(
 	plan->num_sources = total_sources;
 }
 
-static uint32
+uint32
 tp_size_class(uint64 bytes)
 {
 	uint64 limit = TP_BASE_LEVEL_SIZE_BYTES;

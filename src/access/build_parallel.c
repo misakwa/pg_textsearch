@@ -781,7 +781,7 @@ tp_build_parallel(
 			 */
 			FlushRelationBuffers(index);
 
-			/* Link as L0 head in metapage */
+			tp_link_build_segment(index, segment_root);
 			{
 				Buffer			  metabuf;
 				GenericXLogState *state;
@@ -795,10 +795,8 @@ tp_build_parallel(
 				metapage = GenericXLogRegisterBuffer(state, metabuf, 0);
 				metap	 = (TpIndexMetaPage)PageGetContents(metapage);
 
-				metap->level_heads[0]  = segment_root;
-				metap->level_counts[0] = 1;
-				metap->total_docs	   = total_docs;
-				metap->total_len	   = total_len;
+				metap->total_docs = total_docs;
+				metap->total_len  = total_len;
 
 				GenericXLogFinish(state);
 				UnlockReleaseBuffer(metabuf);

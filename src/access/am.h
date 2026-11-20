@@ -111,8 +111,8 @@ PGDLLEXPORT Datum tp_handler(PG_FUNCTION_ARGS);
  * Build utilities (am/build.c)
  */
 
-/* Link a segment as the new L0 chain head in the metapage */
-void tp_link_l0_chain_head(Relation index, BlockNumber segment_root);
+/* Link a built segment as the chain head of its size level */
+void tp_link_build_segment(Relation index, BlockNumber segment_root);
 
 /* Truncate a contiguous EOF suffix already stamped recyclable */
 void tp_truncate_dead_pages(Relation index);
