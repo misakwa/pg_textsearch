@@ -57,7 +57,22 @@ typedef struct TpScanOpaqueData
 	Datum			  filter_value;
 	ItemPointer		  filter_ctids; /* sorted, unique */
 	int				  filter_count;
-	bool			  filter_one_pass; /* first batch seeded, no re-drive */
+	double			  filter_seed_selectivity; /* of a seeded Limit, or 0 */
+
+	/*
+	 * The last btree read, kept across rescans: the scan's snapshot does
+	 * not change, so the same btree and value give the same TIDs.
+	 */
+	bool		filter_read;		/* filter_ctids came from a btree read */
+	int			filter_read_result; /* TpFilterRead of that read */
+	bool		filter_prev_valid;
+	Oid			filter_prev_btree;
+	Datum		filter_prev_value;
+	bool		filter_prev_byval;
+	int16		filter_prev_len;
+	int			filter_prev_result; /* TpFilterRead */
+	ItemPointer filter_prev_ctids;
+	int			filter_prev_count;
 } TpScanOpaqueData;
 
 #define TP_FILTER_NONE	   0 /* no hint */

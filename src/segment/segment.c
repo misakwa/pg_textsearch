@@ -819,7 +819,7 @@ segment_merge_ctids(
  * entries per heap block between consecutive TIDs.  A gap longer than
  * MERGE_JUMP costs a jump, about as much as walking MERGE_JUMP entries.
  */
-double
+static double
 tp_ctid_merge_walked(const ItemPointerData *tids, int n, double per_block)
 {
 	double walked = n > 0 ? per_block : 0;

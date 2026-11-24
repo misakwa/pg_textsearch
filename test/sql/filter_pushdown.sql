@@ -15,11 +15,12 @@
 --   * density  - a sparse filter (3 rows) gallops over each segment's
 --                CTID map, a dense one (10% of the table) merges with it
 --   * runs     - collections stored in runs far apart merge and jump
---                the gaps; the cost rule prices the entries walked
---   * fallback - above pg_textsearch.filter_pushdown_max_rows, or where
---                pg_textsearch.filter_pushdown_cost_ratio expects ranking
---                the whole index to be cheaper (it is for a small LIMIT
---                and a large filter)
+--                the gaps
+--   * no rule  - pushdown at every LIMIT and filter size: an off-topic
+--                query, a rare word, a dense filter (no cost rule picks
+--                ranking the whole index instead)
+--   * fallback - above pg_textsearch.filter_pushdown_max_rows (a memory
+--                bound), or when every entry of the btree matches
 --   * RLS      - user clauses behind a policy are not pushed
 --   * identity - two BM25 scans in one statement use their own filters
 
@@ -219,7 +220,7 @@ SET client_min_messages = WARNING;
 SELECT n, qry, pred, k, fp_check(qry, pred, k) AS result
 FROM (VALUES
     (1, 'w1',            'grp = 1',               8),
-    (2, 'w3 w7 w11',     'grp = 1',              50),
+    (2, 'w3 w7 w11',     'grp = 1',              45),
     (3, 'w3 w7 w11 w19', 'grp = 1',            1500),
     (4, 'w2 w9',         'grp = 1 AND coll = 13', 10)
 ) v(n, qry, pred, k)
@@ -330,50 +331,32 @@ RESET plan_cache_mode;
 RESET pg_textsearch.filter_pushdown_max_rows;
 
 ------------------------------------------------------------------------
--- Fallback by cost.  grp = 1 is 1,400 of 14,000 rows spread over the
--- whole table, though ANALYZE reports grp's correlation as 0.82, so the
--- estimate takes them for partly clustered.  LIMIT 10 keeps pushdown.
--- LIMIT 1 falls back on the estimate, before the btree read.  At LIMIT 2
--- the estimate passes, but the rows read span the whole table and a
--- seeded scan finishes in one pass, so it falls back after the read;
--- without the seed the scan would re-drive, and pushdown stays.  A
--- generic plan made under the default ratio falls back at execution
--- under a tiny one.
+-- No cost rule: grp = 1 is 1,400 of 14,000 rows spread over the whole
+-- table.  Every LIMIT pushes down, seeded or not, and so does a generic
+-- plan.
 ------------------------------------------------------------------------
 
 SET client_min_messages = NOTICE;
 SET pg_textsearch.log_filter_pushdown = on;
 SELECT count(*) FROM (
     SELECT id FROM fp_docs WHERE grp = 1
-    ORDER BY body <@> to_bm25query('w1 w2', 'fp_docs_bm25') LIMIT 10) s;
-SELECT count(*) FROM (
-    SELECT id FROM fp_docs WHERE grp = 1
     ORDER BY body <@> to_bm25query('w1 w2', 'fp_docs_bm25') LIMIT 1) s;
-SELECT count(*) FROM (
-    SELECT id FROM fp_docs WHERE grp = 1
-    ORDER BY body <@> to_bm25query('w1 w2', 'fp_docs_bm25') LIMIT 2) s;
 SET pg_textsearch.filtered_seed = off;
 SELECT count(*) FROM (
     SELECT id FROM fp_docs WHERE grp = 1
     ORDER BY body <@> to_bm25query('w1 w2', 'fp_docs_bm25') LIMIT 2) s;
 RESET pg_textsearch.filtered_seed;
-SET client_min_messages = WARNING;
-SELECT fp_check('w1 w2', 'grp = 1', 1) AS cost_fallback;
-
 SET plan_cache_mode = force_generic_plan;
 PREPARE fp_g AS
     SELECT count(*) FROM (
         SELECT id FROM fp_docs WHERE coll = 7
         ORDER BY body <@> to_bm25query('w1 w2', 'fp_docs_bm25') LIMIT 10) s;
-SET client_min_messages = NOTICE;
-EXECUTE fp_g;
-SET pg_textsearch.filter_pushdown_cost_ratio = 0.01;
 EXECUTE fp_g;
 RESET pg_textsearch.log_filter_pushdown;
 SET client_min_messages = WARNING;
 DEALLOCATE fp_g;
 RESET plan_cache_mode;
-RESET pg_textsearch.filter_pushdown_cost_ratio;
+SELECT fp_check('w1 w2', 'grp = 1', 1) AS limit_one;
 
 ------------------------------------------------------------------------
 -- RLS: under a policy the user's clause carries a security level and
@@ -448,13 +431,11 @@ RESET enable_sort;
 ------------------------------------------------------------------------
 -- Runs: collections stored in runs separated by thousands of other rows,
 -- in two segments plus the memtable.  The merge jumps over each gap
--- with a search instead of walking it, and the cost rule prices the
--- entries walked rather than the first-to-last span.  coll 1 has runs
--- of 40 rows about 4,000 apart; coll 2 a run of 1,800 and one of 100
+-- with a search instead of walking it.  coll 1 has runs of 40 rows
+-- about 4,000 apart; coll 2 a run of 1,800 and one of 100
 -- after a gap of 1,500, inside one bulk read; coll 3 runs of 20 about
 -- 1,500 apart; the rest are 50 scattered collections.  tag = 0 marks
--- coll 1's original rows, and its other values rise along the heap, so
--- ANALYZE takes tag = 0 for clustered.
+-- coll 1's original rows.
 ------------------------------------------------------------------------
 
 CREATE TABLE fp_runs (
@@ -603,25 +584,232 @@ FROM (VALUES
 ) v(n, qry, pred, k)
 ORDER BY n;
 
--- The cost rule after the btree read prices the entries the merge
--- walks: tag = 0 is coll 1's rows (321 TIDs after the updates) in 7
--- runs over the whole table.  Priced by their span, about all 28,000
--- rows, a seeded LIMIT 1 would fall back at ratio 20; the merge walks
--- the runs and jumps the gaps, so pushdown stays.  At ratio 10 it falls
--- back after the read and reports the walked estimate.
+-- With no cost rule a seeded LIMIT 1 pushes down tag = 0 (321 TIDs in 7
+-- runs over the whole table).
 SET client_min_messages = NOTICE;
 SET pg_textsearch.log_filter_pushdown = on;
-SET pg_textsearch.filter_pushdown_cost_ratio = 20;
 SELECT count(*) FROM (
     SELECT id FROM fp_runs WHERE tag = 0
     ORDER BY body <@> to_bm25query('w1 w2', 'fp_runs_bm25') LIMIT 1) s;
-SET pg_textsearch.filter_pushdown_cost_ratio = 10;
-SELECT count(*) FROM (
-    SELECT id FROM fp_runs WHERE tag = 0
-    ORDER BY body <@> to_bm25query('w1 w2', 'fp_runs_bm25') LIMIT 1) s;
-RESET pg_textsearch.filter_pushdown_cost_ratio;
 RESET pg_textsearch.log_filter_pushdown;
 SET client_min_messages = WARNING;
+
+------------------------------------------------------------------------
+-- Topics: 20,000 docs in 10 collections (coll = id % 10), inserted in a
+-- shuffled order, so the (coll, id) btree lists each collection's TIDs
+-- out of CTID order.  coll 0 is about medicine (m words) and has "loan"
+-- in 10 of its 2,000 rows; the other collections are about loans and
+-- have it in every row, so "loan" is off-topic for coll 0.  "zr" is in
+-- 4 rows, 2 of them in coll 0.  lang = 'en' holds 95% of the rows and
+-- tenant = 1 all of them.  Two segments plus the memtable.
+------------------------------------------------------------------------
+
+CREATE TABLE fp_topic (
+    id     int PRIMARY KEY,
+    coll   int NOT NULL,
+    lang   text NOT NULL,
+    tenant int NOT NULL,
+    body   text
+);
+CREATE INDEX fp_topic_coll ON fp_topic (coll, id);
+CREATE INDEX fp_topic_lang ON fp_topic (lang);
+CREATE INDEX fp_topic_tenant ON fp_topic (tenant);
+CREATE INDEX fp_topic_bm25 ON fp_topic USING bm25 (body)
+    WITH (text_config = 'simple');
+
+CREATE FUNCTION fp_topic_body(g int) RETURNS text LANGUAGE sql IMMUTABLE AS $$
+    SELECT (SELECT string_agg(CASE WHEN g % 10 = 0 THEN 'm' ELSE 'l' END
+                              || ((hashint4(g * 16 + i) & 1023) % 30), ' ')
+            FROM generate_series(1, 4 + g % 7) i)
+           || CASE WHEN g % 10 <> 0 OR g % 2000 = 0 THEN ' loan' ELSE '' END
+           || CASE WHEN g IN (7, 4000, 12000, 19999) THEN ' zr' ELSE '' END
+$$;
+
+CREATE FUNCTION fp_topic_load(lo int, hi int) RETURNS void
+LANGUAGE sql AS $$
+    INSERT INTO fp_topic
+    SELECT g, g % 10, CASE WHEN g % 20 = 0 THEN 'fr' ELSE 'en' END, 1,
+           fp_topic_body(g)
+    FROM generate_series(lo, hi) g ORDER BY hashint4(g)
+$$;
+
+SELECT fp_topic_load(1, 8000);
+SELECT bm25_spill_index('fp_topic_bm25') IS NOT NULL AS spilled;
+SELECT fp_topic_load(8001, 16000);
+SELECT bm25_spill_index('fp_topic_bm25') IS NOT NULL AS spilled;
+SELECT fp_topic_load(16001, 20000);
+ANALYZE fp_topic;
+
+CREATE FUNCTION fp_topic_list(qry text, pred text, k int, push bool)
+RETURNS TABLE (n bigint, id int, s float8) LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM set_config('pg_textsearch.filter_pushdown', push::text, true);
+    RETURN QUERY EXECUTE format(
+        'SELECT row_number() OVER (), id, s FROM '
+        '(SELECT id, (body <@> to_bm25query(%L, ''fp_topic_bm25''))::float8 AS s '
+        ' FROM fp_topic WHERE %s '
+        ' ORDER BY body <@> to_bm25query(%L, ''fp_topic_bm25'') '
+        ' LIMIT %s) t', qry, pred, qry, k);
+END;
+$$;
+
+-- As fp_runs_check: parity with pushdown on and off, then the oracle.
+CREATE FUNCTION fp_topic_check(qry text, pred text, k int) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+    on_s   float8[];
+    off_s  float8[];
+    on_id  int[];
+    off_id int[];
+    idx    int[];
+    ora    int[];
+BEGIN
+    SET LOCAL enable_sort = off;
+    CREATE TEMP TABLE fp_on AS SELECT * FROM fp_topic_list(qry, pred, k, true);
+    CREATE TEMP TABLE fp_off AS SELECT * FROM fp_topic_list(qry, pred, k, false);
+    SELECT array_agg(s ORDER BY n),
+           array_agg(id ORDER BY id) FILTER (
+               WHERE s < (SELECT max(s) FROM fp_on))
+    INTO on_s, on_id FROM fp_on;
+    SELECT array_agg(s ORDER BY n),
+           array_agg(id ORDER BY id) FILTER (
+               WHERE s < (SELECT max(s) FROM fp_off))
+    INTO off_s, off_id FROM fp_off;
+    DROP TABLE fp_on, fp_off;
+    IF on_s IS DISTINCT FROM off_s OR on_id IS DISTINCT FROM off_id THEN
+        RETURN format('FAIL pushed=%s %s unpushed=%s %s',
+                      on_id, on_s, off_id, off_s);
+    END IF;
+    PERFORM set_config('pg_textsearch.filter_pushdown', 'on', true);
+    EXECUTE format(
+        'SELECT coalesce(array_agg(id ORDER BY id), ARRAY[]::int[]) '
+        'FROM (SELECT id FROM fp_topic WHERE %s '
+        '      ORDER BY body <@> to_bm25query(%L, ''fp_topic_bm25'') '
+        '      LIMIT 100000) s', pred, qry)
+    INTO idx;
+    EXECUTE format(
+        'SELECT coalesce(array_agg(id ORDER BY id), ARRAY[]::int[]) '
+        'FROM fp_topic WHERE (%s) AND string_to_array(body, '' '') && '
+        '      string_to_array(%L, '' '')', pred, qry)
+    INTO ora;
+    IF idx IS DISTINCT FROM ora THEN
+        RETURN format('FAIL index=%s oracle=%s', idx, ora);
+    END IF;
+    RETURN format('PASS (%s of %s rows)',
+                  coalesce(array_length(on_s, 1), 0),
+                  coalesce(array_length(idx, 1), 0));
+END;
+$$;
+
+CREATE FUNCTION fp_topic_passes(qry text, pred text, k int, push bool)
+RETURNS bigint LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM bm25_debug_scoring_passes(true);
+    PERFORM count(*) FROM fp_topic_list(qry, pred, k, push);
+    RETURN bm25_debug_scoring_passes(true);
+END;
+$$;
+
+-- Pushdown for the off-topic query at LIMIT 10 and 1, for the rare
+-- word, and for the 95% filter; the filter that every row passes ranks
+-- the whole index.
+SET client_min_messages = NOTICE;
+SET pg_textsearch.log_filter_pushdown = on;
+SELECT count(*) FROM (
+    SELECT id FROM fp_topic WHERE coll = 0
+    ORDER BY body <@> to_bm25query('loan', 'fp_topic_bm25') LIMIT 10) s;
+SELECT count(*) FROM (
+    SELECT id FROM fp_topic WHERE coll = 0
+    ORDER BY body <@> to_bm25query('loan', 'fp_topic_bm25') LIMIT 1) s;
+SELECT count(*) FROM (
+    SELECT id FROM fp_topic WHERE coll = 0
+    ORDER BY body <@> to_bm25query('zr', 'fp_topic_bm25') LIMIT 10) s;
+SELECT count(*) FROM (
+    SELECT id FROM fp_topic WHERE lang = 'en'
+    ORDER BY body <@> to_bm25query('loan m3', 'fp_topic_bm25') LIMIT 10) s;
+SELECT count(*) FROM (
+    SELECT id FROM fp_topic WHERE tenant = 1
+    ORDER BY body <@> to_bm25query('loan m3', 'fp_topic_bm25') LIMIT 10) s;
+RESET pg_textsearch.log_filter_pushdown;
+SET client_min_messages = WARNING;
+
+-- The off-topic query scores once with pushdown.  Without it the scan
+-- re-drives until its batch reaches coll 0's few "loan" rows.
+SELECT fp_topic_passes('loan', 'coll = 0', 10, true) AS passes_pushed,
+       fp_topic_passes('loan', 'coll = 0', 10, false) > 1 AS redrives_unpushed;
+
+SELECT n, qry, pred, k, fp_topic_check(qry, pred, k) AS result
+FROM (VALUES
+    (1,  'loan',        'coll = 0',                 10),
+    (2,  'loan',        'coll = 0',                  1),
+    (3,  'loan m3 m7',  'coll = 0',                 10),
+    (4,  'zr',          'coll = 0',                 10),
+    (5,  'zr',          'coll = 7',                 10),
+    (6,  'zr loan',     'coll = 0',                  3),
+    (7,  'm3 m7',       'coll = 0',               3000),
+    (8,  'loan m3',     'lang = ''en''',            10),
+    (9,  'l4 l9',       'lang = ''en''',           100),
+    (10, 'loan m3',     'tenant = 1',               10),
+    (11, 'zr',          'lang = ''en''',            10)
+) v(n, qry, pred, k)
+ORDER BY n;
+
+-- The engine's shape: FETCH FIRST ... WITH TIES behind a semi-join that
+-- keeps one row in seven.  The first batch follows the LIMIT (30 for
+-- k = 10), so the scan re-drives; every row tied at the cut comes back,
+-- the same with pushdown on and off.
+CREATE TABLE fp_topic_acl (id int PRIMARY KEY);
+INSERT INTO fp_topic_acl SELECT id FROM fp_topic WHERE id % 7 = 0;
+ANALYZE fp_topic_acl;
+
+CREATE FUNCTION fp_topic_ties(qry text, pred text, k int, push bool)
+RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+    ids    int[];
+    passes bigint;
+BEGIN
+    SET LOCAL enable_sort = off;
+    SET LOCAL enable_hashjoin = off;
+    SET LOCAL enable_mergejoin = off;
+    PERFORM set_config('pg_textsearch.filter_pushdown', push::text, true);
+    PERFORM bm25_debug_scoring_passes(true);
+    EXECUTE format(
+        'SELECT coalesce(array_agg(id ORDER BY id), ARRAY[]::int[]) FROM '
+        '(SELECT t.id FROM fp_topic t WHERE %s AND EXISTS '
+        '   (SELECT 1 FROM fp_topic_acl a WHERE a.id = t.id) '
+        ' ORDER BY t.body <@> to_bm25query(%L, ''fp_topic_bm25'') '
+        ' FETCH FIRST %s ROWS WITH TIES) s', pred, qry, k)
+    INTO ids;
+    passes := bm25_debug_scoring_passes(true);
+    RETURN format('%s %s %s', coalesce(array_length(ids, 1), 0),
+                  CASE WHEN passes > 1 THEN 're-driven' ELSE 'one-pass' END,
+                  md5(ids::text));
+END;
+$$;
+
+SELECT n, qry, pred, k,
+       split_part(fp_topic_ties(qry, pred, k, true), ' ', 3) =
+           split_part(fp_topic_ties(qry, pred, k, false), ' ', 3) AS same,
+       split_part(fp_topic_ties(qry, pred, k, true), ' ', 1) AS rows,
+       split_part(fp_topic_ties(qry, pred, k, true), ' ', 2) AS pushed
+FROM (VALUES
+    (1, 'm3 m7',   'coll = 0',      10),
+    (2, 'm3',      'coll = 0',      25),
+    (3, 'loan',    'coll = 0',      10),
+    (4, 'l4 l9',   'lang = ''en''', 10)
+) v(n, qry, pred, k)
+ORDER BY n;
+
+-- Rows moved into coll 0 land in the memtable, inside the segment's heap
+-- range; the off-topic query finds them too.
+UPDATE fp_topic SET coll = 0 WHERE id IN (13, 14, 15999);
+SELECT n, qry, pred, k, fp_topic_check(qry, pred, k) AS result
+FROM (VALUES
+    (1, 'loan',       'coll = 0',  20),
+    (2, 'loan l3',    'coll = 0',   5),
+    (3, 'zr',         'coll = 0',  10)
+) v(n, qry, pred, k)
+ORDER BY n;
 
 ------------------------------------------------------------------------
 -- GUC contract
@@ -629,13 +817,14 @@ SET client_min_messages = WARNING;
 
 SHOW pg_textsearch.filter_pushdown;
 SHOW pg_textsearch.filter_pushdown_max_rows;
-SHOW pg_textsearch.filter_pushdown_cost_ratio;
 SET pg_textsearch.filter_pushdown_max_rows = -1;
-SET pg_textsearch.filter_pushdown_cost_ratio = -1;
 
 DROP TABLE fp_acl;
 DROP TABLE fp_docs;
 DROP TABLE fp_runs;
+DROP TABLE fp_topic;
+DROP TABLE fp_topic_acl;
 DROP FUNCTION fp_list, fp_check, fp_oracle, fp_passes, fp_acl_list,
               fp_body, fp_coll, fp_runs_coll, fp_runs_load, fp_runs_list,
-              fp_runs_check;
+              fp_runs_check, fp_topic_body, fp_topic_load, fp_topic_list,
+              fp_topic_check, fp_topic_passes, fp_topic_ties;
