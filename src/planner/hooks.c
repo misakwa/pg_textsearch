@@ -25,7 +25,6 @@
 #include <catalog/pg_opclass.h>
 #include <catalog/pg_operator.h>
 #include <catalog/pg_proc.h>
-#include <catalog/pg_statistic.h>
 #include <catalog/pg_type.h>
 #include <catalog/pg_type_d.h>
 #include <commands/defrem.h>
@@ -51,7 +50,6 @@
 #include <utils/inval.h>
 #include <utils/lsyscache.h>
 #include <utils/rel.h>
-#include <utils/selfuncs.h>
 #include <utils/syscache.h>
 
 #include "compat.h"
@@ -1884,7 +1882,6 @@ tp_find_filter_clause(
 			hint_out->collation = op->inputcollid;
 			hint_out->typlen	= cst->constlen;
 			hint_out->typbyval	= cst->constbyval;
-			hint_out->est_rows	= sel * rel->tuples;
 			hint_out->limit_k	= root->limit_tuples;
 			*value_out			= cst->constvalue;
 			if (cst->constlen == -1)
@@ -1895,26 +1892,6 @@ tp_find_filter_clause(
 			found	 = true;
 			break;
 		}
-	}
-	if (found)
-	{
-		VariableStatData vardata;
-		AttStatsSlot	 sslot;
-
-		examine_variable(root, (Node *)best_var, 0, &vardata);
-		if (HeapTupleIsValid(vardata.statsTuple) &&
-			get_attstatsslot(
-					&sslot,
-					vardata.statsTuple,
-					STATISTIC_KIND_CORRELATION,
-					InvalidOid,
-					ATTSTATSSLOT_NUMBERS))
-		{
-			if (sslot.nnumbers == 1)
-				hint_out->correlation = sslot.numbers[0];
-			free_attstatsslot(&sslot);
-		}
-		ReleaseVariableStats(vardata);
 	}
 	return found;
 }
@@ -1935,8 +1912,7 @@ tp_attach_filter_hints(PlannerInfo *root, RelOptInfo *rel)
 	ListCell		 *lc;
 
 	if (!tp_filter_pushdown || tp_filter_pushdown_max_rows <= 0 ||
-		tp_filter_pushdown_cost_ratio <= 0 || rel->baserestrictinfo == NIL ||
-		rel->indexlist == NIL)
+		rel->baserestrictinfo == NIL || rel->indexlist == NIL)
 		return;
 
 	foreach (lc, rel->pathlist)
@@ -1957,13 +1933,6 @@ tp_attach_filter_hints(PlannerInfo *root, RelOptInfo *rel)
 			if (!get_bm25_oids(&oids))
 				return;
 			have_clause = tp_find_filter_clause(root, rel, &hint, &value);
-			if (have_clause && (hint.est_rows > tp_filter_pushdown_max_rows ||
-								hint.est_rows > tp_filter_pushdown_row_limit(
-														hint.limit_k,
-														rel->tuples,
-														hint.correlation,
-														false)))
-				have_clause = false;
 		}
 		if (!have_clause || ipath->indexinfo->relam != oids.bm25_am_oid)
 			continue;

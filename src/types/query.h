@@ -47,15 +47,13 @@ typedef struct TpQueryFilterHint
 {
 	uint32 magic;
 	uint32 value_len;
-	Oid	   btree_oid;	/* btree whose first column the clause tests */
-	Oid	   proc_oid;	/* equality support function of the operator */
-	Oid	   subtype;		/* right-hand type of the operator */
-	Oid	   collation;	/* input collation of the clause */
-	int16  typlen;		/* of the comparison value */
-	bool   typbyval;	/* of the comparison value */
-	double est_rows;	/* planner estimate of rows matching the clause */
-	double limit_k;		/* LIMIT plus OFFSET of the query, or -1 */
-	double correlation; /* of the column with the heap order */
+	Oid	   btree_oid; /* btree whose first column the clause tests */
+	Oid	   proc_oid;  /* equality support function of the operator */
+	Oid	   subtype;	  /* right-hand type of the operator */
+	Oid	   collation; /* input collation of the clause */
+	int16  typlen;	  /* of the comparison value */
+	bool   typbyval;  /* of the comparison value */
+	double limit_k;	  /* LIMIT plus OFFSET of the query, or -1 */
 } TpQueryFilterHint;
 
 /*

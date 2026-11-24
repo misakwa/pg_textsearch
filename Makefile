@@ -36,6 +36,7 @@ OBJS = \
 	src/access/build_parallel.o \
 	src/access/compaction_api.o \
 	src/access/boolean.o \
+	src/access/filter.o \
 	src/access/rls.o \
 	src/access/scan.o \
 	src/access/vacuum.o \

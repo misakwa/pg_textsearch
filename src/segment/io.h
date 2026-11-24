@@ -200,9 +200,7 @@ extern void tp_segment_close(TpSegmentReader *reader);
 /* Lazy CTID lookup for deferred resolution */
 extern void tp_segment_lookup_ctid(
 		TpSegmentReader *reader, uint32 doc_id, ItemPointerData *ctid_out);
-extern void tp_segment_enable_ctid_lookup_cache(TpSegmentReader *reader);
-extern double
-tp_ctid_merge_walked(const ItemPointerData *tids, int n, double per_block);
+extern void	   tp_segment_enable_ctid_lookup_cache(TpSegmentReader *reader);
 extern uint32 *tp_segment_doc_ids_for_ctids(
 		TpSegmentReader		  *reader,
 		const ItemPointerData *ctids,

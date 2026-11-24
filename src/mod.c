@@ -136,7 +136,6 @@ double tp_filtered_seed_margin = TP_DEFAULT_FILTERED_SEED_MARGIN;
  */
 bool   tp_filter_pushdown			 = true;
 int	   tp_filter_pushdown_max_rows	 = TP_DEFAULT_FILTER_PUSHDOWN_MAX_ROWS;
-double tp_filter_pushdown_cost_ratio = TP_DEFAULT_FILTER_PUSHDOWN_COST_RATIO;
 bool   tp_log_filter_pushdown		 = false;
 
 /*
@@ -683,10 +682,10 @@ _PG_init(void)
 			"pg_textsearch.filter_pushdown",
 			"Restrict BM25 top-k scans to rows an equality filter can match.",
 			"When a BM25 index scan has a filter col = constant and col "
-			"leads a btree index of the same table, the scan reads that "
-			"btree once and scores only the rows it lists, instead of "
-			"ranking the whole index and leaving the filter to drop rows. "
-			"Results are identical either way.",
+			"leads a btree index of the same table, the scan reads the "
+			"rows that btree lists for the constant and scores only those, "
+			"instead of ranking the whole index and leaving the filter to "
+			"drop rows.  Results are identical either way.",
 			&tp_filter_pushdown,
 			true,
 			PGC_USERSET,
@@ -698,33 +697,15 @@ _PG_init(void)
 	DefineCustomIntVariable(
 			"pg_textsearch.filter_pushdown_max_rows",
 			"Largest row set a BM25 filter pushdown reads from the btree.",
-			"A memory bound: the scan keeps 8 bytes per row while it reads "
-			"the btree.  Above this many rows (estimated at planning, "
-			"counted at execution) the scan ranks the whole index as "
-			"without pushdown.  0 disables pushdown.",
+			"A memory bound: the scan needs up to 22 bytes per row while it "
+			"reads and sorts the btree's rows.  Above this many rows "
+			"(estimated at planning, "
+			"counted at execution) the scan ranks the whole index and "
+			"leaves the filter to the executor.  0 disables pushdown.",
 			&tp_filter_pushdown_max_rows,
 			TP_DEFAULT_FILTER_PUSHDOWN_MAX_ROWS,
 			0,
 			INT_MAX / 2,
-			PGC_USERSET,
-			0,
-			NULL,
-			NULL,
-			NULL);
-
-	DefineCustomRealVariable(
-			"pg_textsearch.filter_pushdown_cost_ratio",
-			"Cost of ranking one document without BM25 filter pushdown, "
-			"in units of reading one filter row with it.",
-			"Without pushdown the scan ranks about LIMIT * table rows / "
-			"filter rows documents; with it, the cost grows with the "
-			"filter's rows and their spread over the table.  Pushdown is "
-			"used when it is cheaper (estimated at planning, counted at "
-			"execution).  0 disables pushdown.",
-			&tp_filter_pushdown_cost_ratio,
-			TP_DEFAULT_FILTER_PUSHDOWN_COST_RATIO,
-			0.0,
-			1000000.0,
 			PGC_USERSET,
 			0,
 			NULL,
